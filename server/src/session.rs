@@ -1,0 +1,263 @@
+//! 控制会话处理：认证、代理注册、连接调度。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use rfp_common::frame::{control_framed, recv_msg, send_msg};
+use rfp_common::msg::{version_compatible, Message, ProxyType, VERSION};
+use rfp_common::now_ms;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, info, warn};
+
+use crate::state::{cleanup_session, RegisteredProxy, ServerState, SessionHandle};
+
+/// new_connection 发出后等待 conn_init 的窗口
+const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 处理一条控制连接（Hello 已在接入层解析，认证在此进行）。
+pub async fn handle_control(
+    state: Arc<ServerState>,
+    stream: TcpStream,
+    version: String,
+    token: String,
+    hostname: Option<String>,
+) {
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let _ = stream.set_nodelay(true);
+    let mut framed = control_framed(stream);
+
+    // 认证失败不区分具体原因（防探测）
+    if !token_ok(&state.token, &token) {
+        let _ = send_msg(
+            &mut framed,
+            &Message::Error {
+                code: "auth_failed".into(),
+                message: "authentication failed".into(),
+            },
+        )
+        .await;
+        info!(peer, "rejected: auth failed");
+        return;
+    }
+    if !version_compatible(&version) {
+        let _ = send_msg(
+            &mut framed,
+            &Message::Error {
+                code: "version_mismatch".into(),
+                message: format!("server {VERSION}, client {version}"),
+            },
+        )
+        .await;
+        info!(peer, %version, "rejected: version mismatch");
+        return;
+    }
+
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let handle = Arc::new(SessionHandle {
+        id: session_id.clone(),
+        cmd_tx,
+        registered: Default::default(),
+    });
+    if send_msg(
+        &mut framed,
+        &Message::HelloAck {
+            version: VERSION.into(),
+            session_id: session_id.clone(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    info!(session = %session_id, peer, ?hostname, "session established");
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(msg) => {
+                        if send_msg(&mut framed, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            msg = recv_msg(&mut framed) => {
+                match msg {
+                    Err(e) => {
+                        debug!(session = %session_id, error = %e, "control read error");
+                        break;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Message::RegisterProxy { name, proxy_type, local_addr, remote_port, vhost: _ })) => {
+                        let result =
+                            register_proxy(&state, &handle, &name, proxy_type, remote_port).await;
+                        let ack = match result {
+                            Ok(port) => {
+                                info!(session = %session_id, proxy = %name, port, local_addr = %local_addr, "proxy registered");
+                                Message::RegisterProxyAck { name, ok: true, error: None }
+                            }
+                            Err(err) => {
+                                warn!(session = %session_id, proxy = %name, error = %err, "proxy register rejected");
+                                Message::RegisterProxyAck { name, ok: false, error: Some(err) }
+                            }
+                        };
+                        if send_msg(&mut framed, &ack).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(Message::Ping { ts })) => {
+                        if send_msg(&mut framed, &Message::Pong { ts }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(Message::Pong { ts })) => {
+                        debug!(session = %session_id, rtt_ms = now_ms() - ts, "pong")
+                    }
+                    Ok(Some(Message::Error { code, message })) => {
+                        warn!(session = %session_id, code, message, "client error")
+                    }
+                    Ok(Some(other)) => {
+                        warn!(session = %session_id, ?other, "unexpected message");
+                        let _ = send_msg(
+                            &mut framed,
+                            &Message::Error {
+                                code: "unexpected_message".into(),
+                                message: "unexpected message type".into(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    cleanup_session(&state, &handle).await;
+    info!(session = %session_id, "session closed");
+}
+
+/// 校验并注册代理：名称/端口冲突检查 + 绑定监听 + 注册表登记。
+async fn register_proxy(
+    state: &Arc<ServerState>,
+    session: &Arc<SessionHandle>,
+    name: &str,
+    proxy_type: ProxyType,
+    remote_port: Option<u16>,
+) -> Result<u16, String> {
+    if proxy_type != ProxyType::Tcp {
+        return Err("M1 仅支持 tcp 代理".into());
+    }
+    let Some(port) = remote_port else {
+        return Err("tcp 代理需要 remote_port".into());
+    };
+    if port == 0 {
+        return Err("remote_port 不能为 0".into());
+    }
+
+    let mut registry = state.registry.lock().await;
+    if registry.by_name.contains_key(name) {
+        return Err("同名代理已存在".into());
+    }
+    if registry.by_port.contains_key(&port) {
+        return Err(format!("端口 {port} 已被占用"));
+    }
+    let listener = TcpListener::bind((state.bind_addr.as_str(), port))
+        .await
+        .map_err(|e| format!("监听 {port} 失败: {e}"))?;
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    registry.by_name.insert(name.to_string(), Arc::clone(session));
+    registry.by_port.insert(port, Arc::clone(session));
+    drop(registry);
+
+    let task = tokio::spawn(proxy_listener(
+        Arc::clone(state),
+        Arc::clone(session),
+        name.to_string(),
+        listener,
+    ));
+    session.registered.lock().unwrap().push(RegisteredProxy {
+        name: name.to_string(),
+        port,
+        listener: task,
+    });
+    Ok(port)
+}
+
+/// 代理端口监听：用户连接到达 → 通知 client 回连 → 桥接。
+async fn proxy_listener(
+    state: Arc<ServerState>,
+    session: Arc<SessionHandle>,
+    name: String,
+    listener: TcpListener,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((user, peer)) => {
+                let _ = user.set_nodelay(true);
+                info!(proxy = %name, %peer, "user connection");
+                tokio::spawn(relay(
+                    Arc::clone(&state),
+                    Arc::clone(&session),
+                    name.clone(),
+                    user,
+                ));
+            }
+            Err(e) => {
+                warn!(proxy = %name, error = %e, "accept error");
+                break;
+            }
+        }
+    }
+}
+
+/// 用户连接 ↔ 隧道数据连接桥接。
+async fn relay(
+    state: Arc<ServerState>,
+    session: Arc<SessionHandle>,
+    proxy_name: String,
+    mut user: TcpStream,
+) {
+    let conn_id = state.next_conn_id();
+    if session
+        .cmd_tx
+        .send(Message::NewConnection {
+            conn_id,
+            proxy_name: proxy_name.clone(),
+        })
+        .is_err()
+    {
+        return; // 会话已死，关闭用户连接
+    }
+    let (tx, rx) = oneshot::channel();
+    state.pending.lock().unwrap().insert(conn_id, tx);
+    let mut tunnel = match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
+        Ok(Ok(t)) => t,
+        _ => {
+            state.pending.lock().unwrap().remove(&conn_id);
+            debug!(conn_id, "tunnel conn timeout or aborted");
+            return;
+        }
+    };
+    let _ = tunnel.set_nodelay(true);
+    match tokio::io::copy_bidirectional(&mut user, &mut tunnel).await {
+        Ok((up, down)) => debug!(conn_id, up, down, "connection closed"),
+        Err(e) => debug!(conn_id, error = %e, "connection error"),
+    }
+}
+
+/// 常量时间 token 比较（长度不同直接失败）
+fn token_ok(expected: &str, got: &str) -> bool {
+    if expected.is_empty() {
+        return true; // 未配置 token = 不认证
+    }
+    let (a, b) = (expected.as_bytes(), got.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
