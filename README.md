@@ -54,6 +54,7 @@ rathole 已验证"低内存"这条差异化路线成立，但不做 vhost/HTTP �
 ## Roadmap
 
 - **M1 — TCP 隧道 MVP**：✅ TCP 控制连接 + 长度前缀帧协议，TCP 代理全链路（认证、注册、转发、断线重连）；⏳ TLS（下一步）
+- **M1.5 — 每用户授权模型**：✅ token 即身份（协议零改动），`[[users]]` 端口区间/vhost 通配授权；legacy 全局 token 向后兼容；临时端口区间（32768-60999）硬校验
 - **M2 — QUIC 传输**：控制与数据迁移到 quinn，单连接多路复用、0-RTT 重连
 - **M3 — HTTP/3 网关**：frps 终止 H3 + `:authority` vhost 路由 + ACME 自动证书（边缘终止模式，origin 无需支持 H3）；UDP 代理
 - 之后：STCP/XTCP、metrics、热更新配置
@@ -79,7 +80,25 @@ rathole 已验证"低内存"这条差异化路线成立，但不做 vhost/HTTP �
 cargo build --release
 ```
 
-服务端 `rfps.toml`：
+服务端 `rfps.toml`（推荐：每用户授权模式）：
+
+```toml
+bind_port = 7000
+
+[[users]]
+name = "alice"
+token = "alice-独立token"     # token 即身份
+ports = ["6000-6100", "6200"] # 允许注册的端口区间
+vhosts = ["*.alice.dev"]      # 允许的域名（M3 vhost 路由用）
+
+[[users]]
+name = "bob"
+token = "bob-token"
+ports = ["6300-6400"]
+vhosts = ["bob.example.com"]
+```
+
+也支持 legacy 全局 token（向后兼容，端口不受限但拒绝临时端口区间）：
 
 ```toml
 bind_port = 7000

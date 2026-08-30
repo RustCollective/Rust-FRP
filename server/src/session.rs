@@ -10,7 +10,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::state::{cleanup_session, RegisteredProxy, ServerState, SessionHandle};
+use crate::state::{
+    authorize_port, authorize_vhost, cleanup_session, RegisteredProxy, ServerState, SessionHandle,
+};
 
 /// new_connection 发出后等待 conn_init 的窗口
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,7 +30,7 @@ pub async fn handle_control(
     let mut framed = control_framed(stream);
 
     // 认证失败不区分具体原因（防探测）
-    if !token_ok(&state.token, &token) {
+    let Some(identity) = state.authenticate(&token) else {
         let _ = send_msg(
             &mut framed,
             &Message::Error {
@@ -39,7 +41,7 @@ pub async fn handle_control(
         .await;
         info!(peer, "rejected: auth failed");
         return;
-    }
+    };
     if !version_compatible(&version) {
         let _ = send_msg(
             &mut framed,
@@ -57,6 +59,7 @@ pub async fn handle_control(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(SessionHandle {
         id: session_id.clone(),
+        identity: identity.clone(),
         cmd_tx,
         registered: Default::default(),
     });
@@ -72,7 +75,7 @@ pub async fn handle_control(
     {
         return;
     }
-    info!(session = %session_id, peer, ?hostname, "session established");
+    info!(session = %session_id, user = identity.label(), peer, ?hostname, "session established");
 
     loop {
         tokio::select! {
@@ -93,9 +96,16 @@ pub async fn handle_control(
                         break;
                     }
                     Ok(None) => break,
-                    Ok(Some(Message::RegisterProxy { name, proxy_type, local_addr, remote_port, vhost: _ })) => {
-                        let result =
-                            register_proxy(&state, &handle, &name, proxy_type, remote_port).await;
+                    Ok(Some(Message::RegisterProxy { name, proxy_type, local_addr, remote_port, vhost })) => {
+                        let result = register_proxy(
+                            &state,
+                            &handle,
+                            &name,
+                            proxy_type,
+                            remote_port,
+                            vhost.as_deref(),
+                        )
+                        .await;
                         let ack = match result {
                             Ok(port) => {
                                 info!(session = %session_id, proxy = %name, port, local_addr = %local_addr, "proxy registered");
@@ -141,13 +151,14 @@ pub async fn handle_control(
     info!(session = %session_id, "session closed");
 }
 
-/// 校验并注册代理：名称/端口冲突检查 + 绑定监听 + 注册表登记。
+/// 校验并注册代理：授权检查 + 名称/端口冲突检查 + 绑定监听 + 注册表登记。
 async fn register_proxy(
     state: &Arc<ServerState>,
     session: &Arc<SessionHandle>,
     name: &str,
     proxy_type: ProxyType,
     remote_port: Option<u16>,
+    vhost: Option<&str>,
 ) -> Result<u16, String> {
     if proxy_type != ProxyType::Tcp {
         return Err("M1 仅支持 tcp 代理".into());
@@ -157,6 +168,11 @@ async fn register_proxy(
     };
     if port == 0 {
         return Err("remote_port 不能为 0".into());
+    }
+    // 授权检查（用户模式下端口/vhost 必须在授权范围内）
+    authorize_port(&session.identity, port)?;
+    if let Some(vh) = vhost {
+        authorize_vhost(&session.identity, vh)?;
     }
 
     let mut registry = state.registry.lock().await;
@@ -248,16 +264,4 @@ async fn relay(
         Ok((up, down)) => debug!(conn_id, up, down, "connection closed"),
         Err(e) => debug!(conn_id, error = %e, "connection error"),
     }
-}
-
-/// 常量时间 token 比较（长度不同直接失败）
-fn token_ok(expected: &str, got: &str) -> bool {
-    if expected.is_empty() {
-        return true; // 未配置 token = 不认证
-    }
-    let (a, b) = (expected.as_bytes(), got.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

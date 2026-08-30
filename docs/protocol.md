@@ -111,6 +111,17 @@ frps                          frpc
 - **认证**：`hello.token` 与 server 配置比对（常量时间比较），失败即断开，不区分"token 错"与"其他错误"（防探测）
 - **失败语义**：认证失败 server 回 `error{auth_failed}` 后关闭，不做重试提示
 
+## 认证与授权（M1.5）
+
+**token 即身份**——协议零改动，server 按 token 查用户表：
+
+- **用户模式**（配置了 `[[users]]`）：token → 具名用户，`register_proxy` 时校验
+  - `remote_port` 必须落在用户 `ports` 授权区间（`"6000-6100"` 区间 / `"65533"` 单端口）
+  - `vhost` 必须匹配用户 `vhosts`（精确或 `*.domain` 通配；通配匹配恰好一个左标签：`x.a.com` ✓、`a.com` ✗、`evil-a.com` ✗、`a.b.a.com` ✗）
+- **legacy 模式**（仅全局 token）：端口不受限，但拒绝系统临时端口区间 32768-60999（该区间的端口会被 server 出站连接随机抢占）
+- **Open 模式**（无 token 无用户表）：不认证，行为同 legacy（生产禁止）
+- 授权失败发生在认证之后：`register_proxy_ack.ok = false` 并带明确原因（帮助用户配置），与认证失败的模糊语义区分开
+
 ## 版本策略
 
 - `hello`/`hello_ack` 交换 `version`（如 `"1.0"`）；主号不同即拒绝，次号不同取双方交集行为

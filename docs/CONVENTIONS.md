@@ -32,6 +32,7 @@
 ## 设计决策记录（勿回退）
 
 - M1 明文 TCP 先行，TLS 默认开启随后合入（明文需显式声明）
+- M1.5 授权模型：token 即身份（协议零改动）；`[[users]]` 用户模式优先于全局 token（legacy）；通配 vhost 匹配恰好一个左标签；legacy 模式拒绝临时端口区间 32768-60999
 - M3 H3 采用边缘终止（Cloudflare 模式），不做端到端 QUIC 透传
 - conn_id 由 server 全局自增分配
 - ping/pong 仅做延迟统计，连接活性交给传输层

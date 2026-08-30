@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 pub use config::ServerConfig;
-use state::ServerState;
+use state::{AuthPolicy, ServerState};
 
 /// 首帧（hello / conn_init）等待上限
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,10 +28,15 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
 /// 在已有 listener 上服务（测试入口）
 pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
-    if cfg.token.is_empty() {
-        warn!("token 为空，认证已关闭");
+    let policy = cfg
+        .auth_policy()
+        .map_err(|e| anyhow::anyhow!("认证配置无效: {e}"))?;
+    match &policy {
+        AuthPolicy::Open => warn!("未配置 token 与用户表，认证已关闭"),
+        AuthPolicy::Legacy(_) => warn!("使用全局 token（legacy 模式），建议迁移到 [[users]] 授权"),
+        AuthPolicy::Users(users) => info!(count = users.len(), "用户认证模式"),
     }
-    let state = Arc::new(ServerState::new(cfg.token.clone(), cfg.bind_addr.clone()));
+    let state = Arc::new(ServerState::new(policy, cfg.bind_addr.clone()));
     loop {
         let (mut stream, peer) = match listener.accept().await {
             Ok(x) => x,
