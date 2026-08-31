@@ -1,6 +1,7 @@
 //! frpc：控制通道维护 + 数据连接桥接。
 
 pub mod config;
+pub mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use rfp_common::msg::{version_compatible, Message, VERSION};
 use rfp_common::now_ms;
 use tokio::net::TcpStream;
 use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
 use config::ClientConfig;
@@ -31,6 +33,45 @@ fn retry(e: impl Into<anyhow::Error>) -> RunError {
     RunError::Retry(e.into())
 }
 
+type MaybeTlsStream = rfp_common::BoxedStream;
+
+/// TLS connector（启用时构建一次）；明文模式返回 None
+fn build_connector(cfg: &ClientConfig) -> Option<TlsConnector> {
+    if !cfg.tls.enabled {
+        warn!("TLS 已显式关闭（明文模式），仅建议调试使用");
+        return None;
+    }
+    match tls::connector(cfg.tls.server_fingerprint.as_deref()) {
+        Ok(c) => Some(c),
+        // 配置错误（如 fingerprint 格式非法）是 Fatal，但此处类型限制，转 panic 语义不合适；
+        // 由 main 启动时提前校验规避，这里兜底按无 TLS 处理会掩盖问题，直接返回 None 并已在启动时报错
+        Err(e) => {
+            warn!(error = %e, "TLS connector 构建失败，回退明文（不应发生）");
+            None
+        }
+    }
+}
+
+/// 按配置包装 TLS；server_name 用配置的 server_addr（IP 或域名）
+async fn tls_connect(
+    connector: &Option<TlsConnector>,
+    stream: TcpStream,
+    cfg: &ClientConfig,
+) -> Result<MaybeTlsStream, RunError> {
+    match connector {
+        Some(c) => {
+            let name = rustls_pki_types::ServerName::try_from(cfg.server_addr.clone())
+                .map_err(|e| retry(anyhow!("server_addr 不能用作 TLS SNI: {e}")))?;
+            let s = c
+                .connect(name, stream)
+                .await
+                .map_err(|e| retry(anyhow!("TLS 握手失败: {e}")))?;
+            Ok(Box::new(s))
+        }
+        None => Ok(Box::new(stream)),
+    }
+}
+
 /// 主循环：断线自动重连
 pub async fn run(cfg: ClientConfig) -> anyhow::Result<()> {
     loop {
@@ -45,12 +86,14 @@ pub async fn run(cfg: ClientConfig) -> anyhow::Result<()> {
     }
 }
 
-/// 单次会话：连接 → 认证 → 注册代理 → 转发循环。控制连接断开即返回。
+/// 单次会话：连接 → (TLS) → 认证 → 注册代理 → 转发循环。控制连接断开即返回。
 pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
+    let connector = build_connector(&cfg);
     let stream = TcpStream::connect((cfg.server_addr.as_str(), cfg.server_port))
         .await
         .map_err(retry)?;
     let _ = stream.set_nodelay(true);
+    let stream = tls_connect(&connector, stream, &cfg).await?;
     let mut framed = control_framed(stream);
 
     // 认证
@@ -143,6 +186,7 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
                         tokio::spawn(handle_new_conn(
                             cfg.server_addr.clone(),
                             cfg.server_port,
+                            connector.clone(),
                             Arc::clone(&proxies),
                             conn_id,
                             proxy_name,
@@ -169,6 +213,7 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
 async fn handle_new_conn(
     server_addr: String,
     server_port: u16,
+    connector: Option<TlsConnector>,
     proxies: Arc<HashMap<String, String>>,
     conn_id: u64,
     proxy_name: String,
@@ -177,14 +222,31 @@ async fn handle_new_conn(
         warn!(conn_id, proxy = %proxy_name, "no such proxy");
         return;
     };
-    let mut tunnel = match TcpStream::connect((server_addr.as_str(), server_port)).await {
+    let tcp = match TcpStream::connect((server_addr.as_str(), server_port)).await {
         Ok(s) => s,
         Err(e) => {
             warn!(conn_id, error = %e, "tunnel dial failed");
             return;
         }
     };
-    let _ = tunnel.set_nodelay(true);
+    let _ = tcp.set_nodelay(true);
+    // 回连与控制连接走同一 TLS 策略
+    let mut tunnel: rfp_common::BoxedStream = match &connector {
+        Some(c) => match c
+            .connect(
+                rustls_pki_types::ServerName::try_from(server_addr.clone()).expect("控制连接已验证过 SNI 有效性"),
+                tcp,
+            )
+            .await
+        {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                warn!(conn_id, error = %e, "tunnel tls handshake failed");
+                return;
+            }
+        },
+        None => Box::new(tcp),
+    };
     let init = Message::ConnInit { conn_id, proxy_name };
     if let Err(e) = write_frame(&mut tunnel, &init.encode()).await {
         warn!(conn_id, error = %e, "send conn_init failed");

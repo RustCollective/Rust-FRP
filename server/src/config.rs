@@ -23,6 +23,35 @@ pub struct ServerConfig {
     /// 每用户授权表；非空时启用用户认证模式
     #[serde(default)]
     pub users: Vec<UserConfig>,
+    /// TLS 配置（默认开启；关闭需显式声明）
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// 默认 true；false = 明文模式（不推荐，仅调试用）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 证书/私钥路径（DER 或 PEM）；缺省时自动生成自签并落盘
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            cert: None,
+            key: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

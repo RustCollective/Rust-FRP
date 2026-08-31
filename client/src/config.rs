@@ -16,6 +16,32 @@ pub struct ClientConfig {
     #[serde(default)]
     pub token: String,
     pub proxies: Vec<ProxyConfig>,
+    /// TLS 配置（默认开启）
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// 默认 true；false = 明文模式（不推荐，仅调试用）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// server 证书 SHA256 fingerprint（hex，自签场景 pinning 用）
+    #[serde(default)]
+    pub server_fingerprint: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            server_fingerprint: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

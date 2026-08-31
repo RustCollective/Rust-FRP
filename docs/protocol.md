@@ -107,7 +107,10 @@ frps                          frpc
 
 ## 安全
 
-- **TLS**：M1 用 rustls；server 证书可自签，client 配置 fingerprint 做固定（pinning）。M2 起 QUIC 内建 TLS 1.3，同套证书体系。落地排期：M1 代码先以明文 TCP 跑通全链路，TLS 随后合入
+- **TLS（M1 已落地）**：rustls + TLS 1.3，默认开启，明文需 `[tls] enabled = false` 显式声明。控制连接与数据回连统一在传输层加密，帧格式与协议语义不变（TLS 在 RFP/1 之下）
+  - server 侧：未配置 `tls.cert`/`tls.key` 时自动生成自签证书（CN=rust-frp）并落盘复用，启动日志打印证书 SHA256 fingerprint
+  - client 侧：`tls.server_fingerprint` 固定指纹（自签场景，跳过链验证直接比对叶子证书 hash）；未配置时走系统根验证（真证书场景）
+  - M2 起 QUIC 内建 TLS 1.3，同套证书/fingerprint 体系
 - **认证**：`hello.token` 与 server 配置比对（常量时间比较），失败即断开，不区分"token 错"与"其他错误"（防探测）
 - **失败语义**：认证失败 server 回 `error{auth_failed}` 后关闭，不做重试提示
 

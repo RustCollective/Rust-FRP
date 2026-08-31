@@ -2,13 +2,20 @@
 
 use std::time::Duration;
 
-use rfp_client::config::{ClientConfig, ProxyConfig};
+use rfp_client::config::{ClientConfig, ProxyConfig, TlsConfig as ClientTls};
 use rfp_client::{run_once, RunError};
 use rfp_common::msg::ProxyType;
-use rfp_server::config::UserConfig;
-use rfp_server::{serve, ServerConfig};
+use rfp_server::config::{ServerConfig, TlsConfig as ServerTls, UserConfig};
+use rfp_server::{serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+fn plain_client_tls() -> ClientTls {
+    ClientTls {
+        enabled: false,
+        server_fingerprint: None,
+    }
+}
 
 /// 起一个 echo origin 服务，返回端口
 async fn spawn_echo() -> u16 {
@@ -41,6 +48,11 @@ fn test_server_config(port: u16, token: &str) -> ServerConfig {
         bind_port: port,
         token: token.into(),
         users: vec![],
+        tls: ServerTls {
+            enabled: false,
+            cert: None,
+            key: None,
+        },
     }
 }
 
@@ -65,6 +77,7 @@ async fn tcp_proxy_end_to_end() {
             local_addr: format!("127.0.0.1:{echo_port}"),
             remote_port,
         }],
+        tls: plain_client_tls(),
     }));
 
     // 等待代理就绪（client 注册 → server 绑定监听）
@@ -111,6 +124,7 @@ async fn auth_failure_is_fatal() {
             server_port: srv_port,
             token: "wrong".into(),
             proxies: vec![],
+            tls: plain_client_tls(),
         }),
     )
     .await
@@ -130,6 +144,11 @@ fn user_server_config(port: u16) -> ServerConfig {
             ports: vec!["61000-61010".into()],
             vhosts: vec!["*.alice.dev".into()],
         }],
+        tls: ServerTls {
+            enabled: false,
+            cert: None,
+            key: None,
+        },
     }
 }
 
@@ -162,6 +181,7 @@ async fn user_mode_port_authorization() {
             local_addr: format!("127.0.0.1:{echo_port}"),
             remote_port,
         }],
+        tls: plain_client_tls(),
     };
 
     // 授权范围内：注册成功 + 转发可用
@@ -205,9 +225,129 @@ async fn user_mode_port_authorization() {
             server_port: srv_port,
             token: "bob-token".into(),
             proxies: vec![],
+            tls: plain_client_tls(),
         }),
     )
     .await
     .expect("timeout");
     assert!(matches!(res, Err(RunError::Fatal(_))));
+}
+
+/// TLS + fingerprint pinning 全链路：控制连接与数据回连都走 TLS
+#[tokio::test]
+async fn tls_pinned_end_to_end() {
+    let echo_port = spawn_echo().await;
+
+    // 生成自签证书落盘（服务端复用同一对文件）
+    let (cert, key) = rfp_server::tls::generate_self_signed().unwrap();
+    let fingerprint = rfp_common::sha256_hex(cert.as_ref());
+    let dir = std::env::temp_dir().join(format!("rfp-tls-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.der");
+    let key_path = dir.join("key.der");
+    std::fs::write(&cert_path, cert.as_ref()).unwrap();
+    std::fs::write(&key_path, &key).unwrap();
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(
+        srv_listener,
+        ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: srv_port,
+            token: "secret".into(),
+            users: vec![],
+            tls: ServerTls {
+                enabled: true,
+                cert: Some(cert_path.display().to_string()),
+                key: Some(key_path.display().to_string()),
+            },
+        },
+    ));
+
+    let remote_port = safe_port(16300).await;
+    tokio::spawn(run_once(ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        token: "secret".into(),
+        proxies: vec![ProxyConfig {
+            name: "echo".into(),
+            proxy_type: ProxyType::Tcp,
+            local_addr: format!("127.0.0.1:{echo_port}"),
+            remote_port,
+        }],
+        tls: ClientTls {
+            enabled: true,
+            server_fingerprint: Some(fingerprint),
+        },
+    }));
+
+    // 等代理就绪并验证回显（控制 + 数据连接均经 TLS）
+    let mut user = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(c) = TcpStream::connect(("127.0.0.1", remote_port)).await {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("proxy not ready");
+    user.write_all(b"tls!").await.unwrap();
+    let mut buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), user.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"tls!");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// fingerprint 不匹配：TLS 握手被拒（Retry 语义，重连后仍失败）
+#[tokio::test]
+async fn tls_wrong_fingerprint_rejected() {
+    // 服务端用一对独立证书；client 配全 0 指纹
+    let (cert, key) = rfp_server::tls::generate_self_signed().unwrap();
+    let dir = std::env::temp_dir().join(format!("rfp-tls-wrong-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.der");
+    let key_path = dir.join("key.der");
+    std::fs::write(&cert_path, cert.as_ref()).unwrap();
+    std::fs::write(&key_path, &key).unwrap();
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(
+        srv_listener,
+        ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: srv_port,
+            token: "secret".into(),
+            users: vec![],
+            tls: ServerTls {
+                enabled: true,
+                cert: Some(cert_path.display().to_string()),
+                key: Some(key_path.display().to_string()),
+            },
+        },
+    ));
+
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_once(ClientConfig {
+            server_addr: "127.0.0.1".into(),
+            server_port: srv_port,
+            token: "secret".into(),
+            proxies: vec![],
+            tls: ClientTls {
+                enabled: true,
+                server_fingerprint: Some("00".repeat(32)),
+            },
+        }),
+    )
+    .await
+    .expect("timeout");
+    assert!(matches!(res, Err(RunError::Retry(_))));
+    let _ = std::fs::remove_dir_all(&dir);
 }

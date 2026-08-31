@@ -28,10 +28,12 @@
 - 公网验证环境：tryanderror.cn（103.119.1.117，SSH 端口 60304，
   rfps 部署于 /opt/rust-frp，systemd 托管 `rfps.service`，
   控制端口 10085、测试代理端口 65533 —— 安全组已放行）
+- 本机 rfpc：systemd 托管 `rfpc.service`（/usr/local/bin/rfpc +
+  /etc/rust-frp/rfpc.toml），承载 jyutyu.cn 生产隧道
 
 ## 设计决策记录（勿回退）
 
-- M1 明文 TCP 先行，TLS 默认开启随后合入（明文需显式声明）
+- M1 TLS 已默认开启（rustls TLS 1.3）：未配置证书时 server 自动生成自签并落盘复用；client 用 fingerprint pinning（自签）或系统根验证（真证书）；明文必须显式 `enabled = false`。协议层不变，TLS 在帧格式之下
 - M1.5 授权模型：token 即身份（协议零改动）；`[[users]]` 用户模式优先于全局 token（legacy）；通配 vhost 匹配恰好一个左标签；legacy 模式拒绝临时端口区间 32768-60999
 - M3 H3 采用边缘终止（Cloudflare 模式），不做端到端 QUIC 透传
 - conn_id 由 server 全局自增分配

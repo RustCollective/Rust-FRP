@@ -6,27 +6,27 @@ use std::time::Duration;
 use rfp_common::frame::{control_framed, recv_msg, send_msg};
 use rfp_common::msg::{version_compatible, Message, ProxyType, VERSION};
 use rfp_common::now_ms;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    authorize_port, authorize_vhost, cleanup_session, RegisteredProxy, ServerState, SessionHandle,
+    authorize_port, authorize_vhost, cleanup_session, AsyncStream, BoxedStream, RegisteredProxy,
+    ServerState, SessionHandle,
 };
 
 /// new_connection 发出后等待 conn_init 的窗口
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 处理一条控制连接（Hello 已在接入层解析，认证在此进行）。
-pub async fn handle_control(
+pub async fn handle_control<S: AsyncStream>(
     state: Arc<ServerState>,
-    stream: TcpStream,
+    stream: S,
+    peer: String,
     version: String,
     token: String,
     hostname: Option<String>,
 ) {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-    let _ = stream.set_nodelay(true);
     let mut framed = control_framed(stream);
 
     // 认证失败不区分具体原因（防探测）
@@ -236,7 +236,7 @@ async fn relay(
     state: Arc<ServerState>,
     session: Arc<SessionHandle>,
     proxy_name: String,
-    mut user: TcpStream,
+    mut user: tokio::net::TcpStream,
 ) {
     let conn_id = state.next_conn_id();
     if session
@@ -251,7 +251,7 @@ async fn relay(
     }
     let (tx, rx) = oneshot::channel();
     state.pending.lock().unwrap().insert(conn_id, tx);
-    let mut tunnel = match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
+    let mut tunnel: BoxedStream = match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
         Ok(Ok(t)) => t,
         _ => {
             state.pending.lock().unwrap().remove(&conn_id);
@@ -259,7 +259,6 @@ async fn relay(
             return;
         }
     };
-    let _ = tunnel.set_nodelay(true);
     match tokio::io::copy_bidirectional(&mut user, &mut tunnel).await {
         Ok((up, down)) => debug!(conn_id, up, down, "connection closed"),
         Err(e) => debug!(conn_id, error = %e, "connection error"),

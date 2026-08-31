@@ -53,7 +53,7 @@ rathole 已验证"低内存"这条差异化路线成立，但不做 vhost/HTTP �
 
 ## Roadmap
 
-- **M1 — TCP 隧道 MVP**：✅ TCP 控制连接 + 长度前缀帧协议，TCP 代理全链路（认证、注册、转发、断线重连）；⏳ TLS（下一步）
+- **M1 — TCP 隧道 MVP**：✅ TCP 控制连接 + 长度前缀帧协议，TCP 代理全链路（认证、注册、转发、断线重连）；✅ TLS 默认加密（rustls，自签 + fingerprint pinning，明文需显式声明）
 - **M1.5 — 每用户授权模型**：✅ token 即身份（协议零改动），`[[users]]` 端口区间/vhost 通配授权；legacy 全局 token 向后兼容；临时端口区间（32768-60999）硬校验
 - **M2 — QUIC 传输**：控制与数据迁移到 quinn，单连接多路复用、0-RTT 重连
 - **M3 — HTTP/3 网关**：frps 终止 H3 + `:authority` vhost 路由 + ACME 自动证书（边缘终止模式，origin 无需支持 H3）；UDP 代理
@@ -109,12 +109,21 @@ token = "secret"
 ./target/release/rfps -c rfps.toml
 ```
 
+启动日志会打印证书 fingerprint（未配置证书时自动生成自签并落盘复用）：
+
+```
+TLS 就绪（client 配置 server_fingerprint = "603d904e..."）
+```
+
 客户端 `rfpc.toml`：
 
 ```toml
 server_addr = "your.server.ip"
 server_port = 7000
 token = "secret"
+
+[tls]
+server_fingerprint = "603d904e..."   # rfps 启动日志里的 fingerprint
 
 [[proxies]]
 name = "ssh"
@@ -128,7 +137,7 @@ remote_port = 6022
 # ssh -p 6022 user@your.server.ip
 ```
 
-M1 现状：TCP 代理已可用（认证、注册、转发、断线自动重连）。TLS 未接入前控制与数据连接均为明文，token 仅防误用、不防窃听。
+M1 现状：TCP 代理全链路（认证、注册、转发、断线自动重连）。**TLS 默认开启**（TLS 1.3，控制连接与数据回连均为密文）；`[tls] enabled = false` 可显式降级明文（仅调试）。真证书（如 Let's Encrypt）场景 client 可省略 fingerprint，走系统根验证。
 
 ## 开发
 

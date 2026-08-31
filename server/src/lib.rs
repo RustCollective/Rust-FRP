@@ -3,6 +3,7 @@
 pub mod config;
 mod session;
 mod state;
+pub mod tls;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use rfp_common::frame::{read_frame, write_frame};
 use rfp_common::msg::Message;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 pub use config::ServerConfig;
@@ -37,8 +38,14 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
         AuthPolicy::Users(users) => info!(count = users.len(), "用户认证模式"),
     }
     let state = Arc::new(ServerState::new(policy, cfg.bind_addr.clone()));
+    let tls_setup = if cfg.tls.enabled {
+        Some(tls::setup(cfg.tls.cert.as_deref(), cfg.tls.key.as_deref())?)
+    } else {
+        warn!("TLS 已显式关闭（明文模式），仅建议调试使用");
+        None
+    };
     loop {
-        let (mut stream, peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "accept error");
@@ -46,9 +53,21 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
             }
         };
         let state = Arc::clone(&state);
+        let tls_setup = tls_setup.clone();
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             let peer = peer.to_string();
+            // TLS 握手（启用时）；此后为明文/统一抽象流
+            let mut stream: state::BoxedStream = match &tls_setup {
+                Some(t) => match t.acceptor.accept(stream).await {
+                    Ok(s) => Box::new(s),
+                    Err(e) => {
+                        debug!(peer, error = %e, "tls handshake failed");
+                        return;
+                    }
+                },
+                None => Box::new(stream),
+            };
             // 首帧识别：Hello → 控制会话；ConnInit → 数据连接
             let first =
                 match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut stream)).await {
@@ -68,10 +87,10 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
                     token,
                     hostname,
                 }) => {
-                    session::handle_control(state, stream, version, token, hostname).await;
+                    session::handle_control(state, stream, peer, version, token, hostname).await;
                 }
                 Ok(Message::ConnInit { conn_id, .. }) => {
-                    handle_data_conn(&state, stream, conn_id).await;
+                    handle_data_conn(&state, stream, conn_id);
                 }
                 Ok(other) => {
                     debug!(peer, ?other, "unexpected first frame");
@@ -95,7 +114,7 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
 }
 
 /// 数据连接：按 ConnInit.conn_id 匹配等待中的用户连接并移交，桥接在 relay 侧完成。
-async fn handle_data_conn(state: &ServerState, stream: TcpStream, conn_id: u64) {
+fn handle_data_conn(state: &ServerState, stream: state::BoxedStream, conn_id: u64) {
     let tx = state.pending.lock().unwrap().remove(&conn_id);
     match tx {
         Some(tx) => {

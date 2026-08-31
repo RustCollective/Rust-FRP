@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rfp_common::msg::Message;
-use tokio::net::TcpStream;
+pub use rfp_common::{AsyncStream, BoxedStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -84,7 +84,7 @@ pub struct ServerState {
     /// 注册临界区含 bind（await），用 tokio Mutex
     pub registry: tokio::sync::Mutex<Registry>,
     /// conn_id → 等待隧道连接的用户连接
-    pub pending: Mutex<HashMap<u64, oneshot::Sender<TcpStream>>>,
+    pub pending: Mutex<HashMap<u64, oneshot::Sender<BoxedStream>>>,
 }
 
 impl ServerState {
