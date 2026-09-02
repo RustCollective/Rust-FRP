@@ -74,20 +74,26 @@ frps                          frpc
 - 代价：每用户连接一次额外 TCP 握手（client 主动回连）。**连接池作为 M1 优化项后置**，不影响协议语义
 - 超时：`new_connection` 发出后 5 秒内未收到对应 `conn_init`，server 关闭用户连接
 
-### M2：QUIC bi-stream
+### M2：QUIC bi-stream（已实现）
 
 ```
-frps                          frpc
-  │ 用户连接到达                 │
-  │── 打开新 bi-stream ────────►│ (同一条 QUIC 连接上)
-  │── stream 首帧: conn_init ──►│
-  │        双向裸字节透传         │
+frpc                                    frps
+  │  QUIC + TLS 1.3 握手（ALPN rfp/1）     │
+  │── open_bi: 控制通道（首条）──────────►│
+  │   Hello → …（帧格式不变）              │
+  │                                       │ 用户连接到达
+  │◄── server open_bi: 数据流 ───────────│ (同一条 QUIC 连接上)
+  │◄── stream 首帧: conn_init ────────────│
+  │        双向裸字节透传                   │
 ```
 
-- server 收到用户连接后，在既有 QUIC 连接上开 bi-stream，首帧仍为 `conn_init`（格式不变，`conn_id` 此时仅作日志关联）
+- client 打开的第一条 bi-stream 即控制通道，其后帧交互与 M1 完全一致（协议零改动）
+- server 收到用户连接后，在既有 QUIC 连接上开 bi-stream，首帧仍为 `conn_init`（`conn_id` 仅作日志关联）
 - FIN 映射：用户连接半关闭 ↔ stream 半关闭；QUIC 流取消（STOP_SENDING/RESET）映射为对端读关闭
-- `new_connection` 控制消息在 M2 废弃，改由 stream 首帧携带调度信息
+- `new_connection` 控制消息在 QUIC 路径废弃，改由 stream 首帧携带调度信息
 - 无需连接池：QUIC stream 建立零成本
+- 0-RTT：client 复用 endpoint 保留会话票据，重连时 `into_0rtt` 携带 Hello 早发（early data）；被拒（server 重启/票据过期）自动降级为握手后的 1-RTT 流。Hello 走 early data 存在重放面：重复认证+注册会被端口冲突检查挡下，当前接受此权衡
+- TLS：QUIC 内生 TLS 1.3（无明文模式），复用 M1 的证书与 fingerprint pinning 体系
 
 ## H3 网关（M3）
 

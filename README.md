@@ -55,7 +55,7 @@ rathole 已验证"低内存"这条差异化路线成立，但不做 vhost/HTTP �
 
 - **M1 — TCP 隧道 MVP**：✅ TCP 控制连接 + 长度前缀帧协议，TCP 代理全链路（认证、注册、转发、断线重连）；✅ TLS 默认加密（rustls，自签 + fingerprint pinning，明文需显式声明）
 - **M1.5 — 每用户授权模型**：✅ token 即身份（协议零改动），`[[users]]` 端口区间/vhost 通配授权；legacy 全局 token 向后兼容；临时端口区间（32768-60999）硬校验
-- **M2 — QUIC 传输**：控制与数据迁移到 quinn，单连接多路复用、0-RTT 重连
+- **M2 — QUIC 传输**：✅ quinn 单连接多路复用（数据隧道 = server 主动 open_bi，无回连无连接池）；0-RTT 断线重连（endpoint 复用 + early data，被拒自动降级 1-RTT）；与 TCP 传输共存，server `[quic]` / client `transport` 显式启用
 - **M3 — HTTP/3 网关**：frps 终止 H3 + `:authority` vhost 路由 + ACME 自动证书（边缘终止模式，origin 无需支持 H3）；UDP 代理
 - 之后：STCP/XTCP、metrics、热更新配置
 
@@ -137,7 +137,17 @@ remote_port = 6022
 # ssh -p 6022 user@your.server.ip
 ```
 
-M1 现状：TCP 代理全链路（认证、注册、转发、断线自动重连）。**TLS 默认开启**（TLS 1.3，控制连接与数据回连均为密文）；`[tls] enabled = false` 可显式降级明文（仅调试）。真证书（如 Let's Encrypt）场景 client 可省略 fingerprint，走系统根验证。
+QUIC 传输（M2，可选）——server 的 `rfps.toml` 加：
+
+```toml
+[quic]
+enabled = true          # UDP 监听，缺省复用 bind_port
+# bind_port = 7000      # 也可单独指定 UDP 端口
+```
+
+client 的 `rfpc.toml` 加 `transport = "quic"`（其余配置不变，fingerprint 与 TCP 路径共用）。云服务器需在安全组放行对应 UDP 端口。
+
+M2 现状：TCP 与 QUIC 双传输共存。**QUIC 传输**：server 配置 `[quic] enabled = true`（UDP 缺省复用 `bind_port`，云安全组需放行 UDP）、client 配置 `transport = "quic"` 即切换；帧协议与授权模型零改动，数据隧道由 server 在同一 QUIC 连接上开 bi-stream 下发，无 M1 的回连开销；rfpc 进程内断线重连走会话恢复（0-RTT 早发 Hello，被拒自动降级）。默认仍为 TCP（生产稳定优先），公网全面切换待 M2 验证期结束后。
 
 ## 开发
 
