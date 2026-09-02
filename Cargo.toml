@@ -18,7 +18,7 @@ toml = "0.8"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -26,6 +26,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 rustls-webpki = "0.103"
+quinn = "0.11"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 sha2 = "0.10"
 

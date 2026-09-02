@@ -3,20 +3,32 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rfp_common::frame::{control_framed, recv_msg, send_msg};
+use rfp_common::frame::{control_framed, recv_msg, send_msg, write_frame};
 use rfp_common::msg::{version_compatible, Message, ProxyType, VERSION};
 use rfp_common::now_ms;
+use rfp_common::quic::QuicStream;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::state::{
-    authorize_port, authorize_vhost, cleanup_session, AsyncStream, BoxedStream, RegisteredProxy,
-    ServerState, SessionHandle,
+    authorize_port, authorize_vhost, cleanup_session, AsyncStream, BoxedStream, DataTransport,
+    RegisteredProxy, ServerState, SessionHandle,
 };
 
 /// new_connection 发出后等待 conn_init 的窗口
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 发送拒绝消息并确认对端收到后再关闭。
+/// QUIC 流 drop 时会 reset（丢弃未发出的数据），必须显式 shutdown（发 FIN）；
+/// 且需等到对端关闭连接（读到 EOF/错误）才返回，否则 Error 帧可能随连接关闭被丢。
+async fn reject<S: AsyncStream>(framed: &mut rfp_common::frame::Control<S>, msg: Message) {
+    use tokio::io::AsyncWriteExt;
+    let _ = send_msg(framed, &msg).await;
+    let _ = framed.get_mut().shutdown().await;
+    // 等对端读完关闭（防挂死：2s 兜底超时）
+    let _ = tokio::time::timeout(Duration::from_secs(2), recv_msg(framed)).await;
+}
 
 /// 处理一条控制连接（Hello 已在接入层解析，认证在此进行）。
 pub async fn handle_control<S: AsyncStream>(
@@ -26,14 +38,15 @@ pub async fn handle_control<S: AsyncStream>(
     version: String,
     token: String,
     hostname: Option<String>,
+    data: DataTransport,
 ) {
     let mut framed = control_framed(stream);
 
     // 认证失败不区分具体原因（防探测）
     let Some(identity) = state.authenticate(&token) else {
-        let _ = send_msg(
+        reject(
             &mut framed,
-            &Message::Error {
+            Message::Error {
                 code: "auth_failed".into(),
                 message: "authentication failed".into(),
             },
@@ -43,9 +56,9 @@ pub async fn handle_control<S: AsyncStream>(
         return;
     };
     if !version_compatible(&version) {
-        let _ = send_msg(
+        reject(
             &mut framed,
-            &Message::Error {
+            Message::Error {
                 code: "version_mismatch".into(),
                 message: format!("server {VERSION}, client {version}"),
             },
@@ -61,6 +74,7 @@ pub async fn handle_control<S: AsyncStream>(
         id: session_id.clone(),
         identity: identity.clone(),
         cmd_tx,
+        data,
         registered: Default::default(),
     });
     if send_msg(
@@ -231,7 +245,7 @@ async fn proxy_listener(
     }
 }
 
-/// 用户连接 ↔ 隧道数据连接桥接。
+/// 用户连接 ↔ 隧道数据通道桥接。
 async fn relay(
     state: Arc<ServerState>,
     session: Arc<SessionHandle>,
@@ -239,24 +253,48 @@ async fn relay(
     mut user: tokio::net::TcpStream,
 ) {
     let conn_id = state.next_conn_id();
-    if session
-        .cmd_tx
-        .send(Message::NewConnection {
-            conn_id,
-            proxy_name: proxy_name.clone(),
-        })
-        .is_err()
-    {
-        return; // 会话已死，关闭用户连接
-    }
-    let (tx, rx) = oneshot::channel();
-    state.pending.lock().unwrap().insert(conn_id, tx);
-    let mut tunnel: BoxedStream = match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
-        Ok(Ok(t)) => t,
-        _ => {
-            state.pending.lock().unwrap().remove(&conn_id);
-            debug!(conn_id, "tunnel conn timeout or aborted");
-            return;
+    let mut tunnel: BoxedStream = match &session.data {
+        // M1 TCP：通知 client 回连，经 pending 表匹配移交
+        DataTransport::Tcp => {
+            if session
+                .cmd_tx
+                .send(Message::NewConnection {
+                    conn_id,
+                    proxy_name: proxy_name.clone(),
+                })
+                .is_err()
+            {
+                return; // 会话已死，关闭用户连接
+            }
+            let (tx, rx) = oneshot::channel();
+            state.pending.lock().unwrap().insert(conn_id, tx);
+            match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
+                Ok(Ok(t)) => t,
+                _ => {
+                    state.pending.lock().unwrap().remove(&conn_id);
+                    debug!(conn_id, "tunnel conn timeout or aborted");
+                    return;
+                }
+            }
+        }
+        // M2 QUIC：直接在既有连接上开 bi-stream，首帧 ConnInit 标识归属
+        DataTransport::Quic(quic) => {
+            let mut stream: QuicStream = match quic.open_bi().await {
+                Ok(s) => QuicStream::from(s),
+                Err(e) => {
+                    debug!(conn_id, error = %e, "quic open_bi failed");
+                    return;
+                }
+            };
+            let init = Message::ConnInit {
+                conn_id,
+                proxy_name: proxy_name.clone(),
+            };
+            if let Err(e) = write_frame(&mut stream, &init.encode()).await {
+                debug!(conn_id, error = %e, "quic conn_init write failed");
+                return;
+            }
+            Box::new(stream)
         }
     };
     match tokio::io::copy_bidirectional(&mut user, &mut tunnel).await {

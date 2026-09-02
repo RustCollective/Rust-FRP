@@ -5,6 +5,7 @@
 //! fingerprint 稳定供 client pinning。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -16,6 +17,8 @@ pub const AUTO_KEY: &str = "rfps-auto-key.der";
 #[derive(Clone)]
 pub struct TlsSetup {
     pub acceptor: tokio_rustls::TlsAcceptor,
+    /// 底层 rustls 配置（QUIC 路径复用同一证书）
+    pub rustls: Arc<RustlsServerConfig>,
     /// 叶子证书 SHA256 fingerprint（hex，供 client pinning）
     pub fingerprint: String,
 }
@@ -75,8 +78,10 @@ pub fn setup(cert_path: Option<&str>, key_path: Option<&str>) -> Result<TlsSetup
         cert_file = %cpath.display(),
         "TLS 就绪（client 配置 server_fingerprint = \"{fingerprint}\"）"
     );
+    let cfg = Arc::new(cfg);
     Ok(TlsSetup {
-        acceptor: tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)),
+        acceptor: tokio_rustls::TlsAcceptor::from(Arc::clone(&cfg)),
+        rustls: cfg,
         fingerprint,
     })
 }

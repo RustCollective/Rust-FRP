@@ -22,6 +22,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 rcgen.workspace = true
+quinn.workspace = true
 
 [dev-dependencies]
 rfp-client = { path = "../client" }

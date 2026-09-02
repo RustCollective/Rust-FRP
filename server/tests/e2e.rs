@@ -2,11 +2,13 @@
 
 use std::time::Duration;
 
-use rfp_client::config::{ClientConfig, ProxyConfig, TlsConfig as ClientTls};
-use rfp_client::{run_once, RunError};
+use rfp_client::config::{ClientConfig, ProxyConfig, TlsConfig as ClientTls, Transport};
+use rfp_client::{quic_endpoint, run_once, run_quic_once, RunError};
 use rfp_common::msg::ProxyType;
-use rfp_server::config::{ServerConfig, TlsConfig as ServerTls, UserConfig};
-use rfp_server::{serve};
+use rfp_server::config::{
+    QuicConfig, ServerConfig, TlsConfig as ServerTls, UserConfig,
+};
+use rfp_server::serve;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -53,6 +55,7 @@ fn test_server_config(port: u16, token: &str) -> ServerConfig {
             cert: None,
             key: None,
         },
+        quic: QuicConfig::default(),
     }
 }
 
@@ -70,6 +73,7 @@ async fn tcp_proxy_end_to_end() {
     tokio::spawn(run_once(ClientConfig {
         server_addr: "127.0.0.1".into(),
         server_port: srv_port,
+        transport: Transport::Tcp,
         token: "secret".into(),
         proxies: vec![ProxyConfig {
             name: "echo".into(),
@@ -122,6 +126,7 @@ async fn auth_failure_is_fatal() {
         run_once(ClientConfig {
             server_addr: "127.0.0.1".into(),
             server_port: srv_port,
+            transport: Transport::Tcp,
             token: "wrong".into(),
             proxies: vec![],
             tls: plain_client_tls(),
@@ -149,6 +154,7 @@ fn user_server_config(port: u16) -> ServerConfig {
             cert: None,
             key: None,
         },
+        quic: QuicConfig::default(),
     }
 }
 
@@ -174,6 +180,7 @@ async fn user_mode_port_authorization() {
     let client = |remote_port: u16| ClientConfig {
         server_addr: "127.0.0.1".into(),
         server_port: srv_port,
+        transport: Transport::Tcp,
         token: "alice-token".into(),
         proxies: vec![ProxyConfig {
             name: "echo".into(),
@@ -223,6 +230,7 @@ async fn user_mode_port_authorization() {
         run_once(ClientConfig {
             server_addr: "127.0.0.1".into(),
             server_port: srv_port,
+            transport: Transport::Tcp,
             token: "bob-token".into(),
             proxies: vec![],
             tls: plain_client_tls(),
@@ -262,6 +270,7 @@ async fn tls_pinned_end_to_end() {
                 cert: Some(cert_path.display().to_string()),
                 key: Some(key_path.display().to_string()),
             },
+            quic: QuicConfig::default(),
         },
     ));
 
@@ -269,6 +278,7 @@ async fn tls_pinned_end_to_end() {
     tokio::spawn(run_once(ClientConfig {
         server_addr: "127.0.0.1".into(),
         server_port: srv_port,
+        transport: Transport::Tcp,
         token: "secret".into(),
         proxies: vec![ProxyConfig {
             name: "echo".into(),
@@ -330,6 +340,7 @@ async fn tls_wrong_fingerprint_rejected() {
                 cert: Some(cert_path.display().to_string()),
                 key: Some(key_path.display().to_string()),
             },
+            quic: QuicConfig::default(),
         },
     ));
 
@@ -338,6 +349,7 @@ async fn tls_wrong_fingerprint_rejected() {
         run_once(ClientConfig {
             server_addr: "127.0.0.1".into(),
             server_port: srv_port,
+            transport: Transport::Tcp,
             token: "secret".into(),
             proxies: vec![],
             tls: ClientTls {
@@ -350,4 +362,196 @@ async fn tls_wrong_fingerprint_rejected() {
     .expect("timeout");
     assert!(matches!(res, Err(RunError::Retry(_))));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 落盘一对自签证书，返回 (cert_path, key_path, fingerprint)
+fn write_cert(dir_tag: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let (cert, key) = rfp_server::tls::generate_self_signed().unwrap();
+    let fingerprint = rfp_common::sha256_hex(cert.as_ref());
+    let dir = std::env::temp_dir().join(format!("{dir_tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.der");
+    let key_path = dir.join("key.der");
+    std::fs::write(&cert_path, cert.as_ref()).unwrap();
+    std::fs::write(&key_path, &key).unwrap();
+    (cert_path, key_path, fingerprint)
+}
+
+fn quic_server_config(srv_port: u16, cert: &str, key: &str) -> ServerConfig {
+    ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: srv_port,
+        token: "secret".into(),
+        users: vec![],
+        tls: ServerTls {
+            enabled: true,
+            cert: Some(cert.into()),
+            key: Some(key.into()),
+        },
+        quic: QuicConfig {
+            enabled: true,
+            bind_port: None,
+        },
+    }
+}
+
+/// 等代理就绪并回读一轮 echo，返回用户连接。
+/// 旧会话清理有延迟：端口可能已监听但隧道已死（连接被重置），需整体重试。
+async fn wait_proxy_and_echo(remote_port: u16) -> tokio::net::TcpStream {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(mut c) = TcpStream::connect(("127.0.0.1", remote_port)).await {
+                if c.write_all(b"quic!").await.is_ok() {
+                    let mut buf = [0u8; 5];
+                    let read = tokio::time::timeout(Duration::from_secs(2), c.read_exact(&mut buf))
+                        .await
+                        .unwrap_or(Err(std::io::Error::other("read timeout")));
+                    if read.is_ok() && &buf == b"quic!" {
+                        return c;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("proxy not ready")
+}
+
+/// QUIC 全链路：TLS 内生 + fingerprint pinning + server 下发 bi-stream 数据隧道
+#[tokio::test]
+async fn quic_end_to_end() {
+    let echo_port = spawn_echo().await;
+    let (cert_path, key_path, fingerprint) = write_cert("rfp-quic-test");
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(
+        srv_listener,
+        quic_server_config(srv_port, &cert_path.display().to_string(), &key_path.display().to_string()),
+    ));
+
+    let remote_port = safe_port(16400).await;
+    let cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Quic,
+        token: "secret".into(),
+        proxies: vec![ProxyConfig {
+            name: "echo".into(),
+            proxy_type: ProxyType::Tcp,
+            local_addr: format!("127.0.0.1:{echo_port}"),
+            remote_port,
+        }],
+        tls: ClientTls {
+            enabled: true,
+            server_fingerprint: Some(fingerprint),
+        },
+    };
+    let endpoint = quic_endpoint(&cfg).unwrap();
+    let ep = endpoint.clone();
+    tokio::spawn(async move { run_quic_once(&ep, cfg).await });
+
+    let mut user = wait_proxy_and_echo(remote_port).await;
+    // 流式连续性：第二段写读
+    user.write_all(b"second chunk").await.unwrap();
+    let mut buf2 = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(5), user.read_exact(&mut buf2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf2, b"second chunk");
+
+    let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+}
+
+/// QUIC 断线重连：会话票据保留在复用的 endpoint 上，重连走恢复（含 0-RTT 路径）
+#[tokio::test]
+async fn quic_reconnect_after_drop() {
+    let echo_port = spawn_echo().await;
+    let (cert_path, key_path, fingerprint) = write_cert("rfp-quic-reconnect");
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(
+        srv_listener,
+        quic_server_config(srv_port, &cert_path.display().to_string(), &key_path.display().to_string()),
+    ));
+
+    let remote_port = safe_port(16500).await;
+    let cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Quic,
+        token: "secret".into(),
+        proxies: vec![ProxyConfig {
+            name: "echo".into(),
+            proxy_type: ProxyType::Tcp,
+            local_addr: format!("127.0.0.1:{echo_port}"),
+            remote_port,
+        }],
+        tls: ClientTls {
+            enabled: true,
+            server_fingerprint: Some(fingerprint),
+        },
+    };
+    let endpoint = quic_endpoint(&cfg).unwrap();
+    let endpoint2 = endpoint.clone();
+    let cfg_for_task = cfg.clone();
+    let task = tokio::spawn(async move { run_quic_once(&endpoint, cfg_for_task).await });
+    let _user = wait_proxy_and_echo(remote_port).await;
+
+    // 模拟连接断开：任务 abort（连接随之关闭），endpoint 克隆保留 → 会话票据存活
+    task.abort();
+
+    // 同一 endpoint 重连（rfpc run() 的生产路径）：走会话恢复 / 0-RTT；
+    // server 侧旧会话清理有延迟，注册冲突按 Retry 重试
+    let cfg2 = cfg.clone();
+    tokio::spawn(async move {
+        loop {
+            if matches!(run_quic_once(&endpoint2, cfg2.clone()).await, Ok(())) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    // 重连后隧道仍可用
+    let _user2 = wait_proxy_and_echo(remote_port).await;
+
+    let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+}
+
+/// QUIC 认证失败：Fatal
+#[tokio::test]
+async fn quic_auth_failure_is_fatal() {
+    let (cert_path, key_path, fingerprint) = write_cert("rfp-quic-auth");
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(
+        srv_listener,
+        quic_server_config(srv_port, &cert_path.display().to_string(), &key_path.display().to_string()),
+    ));
+
+    let cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Quic,
+        token: "wrong".into(),
+        proxies: vec![],
+        tls: ClientTls {
+            enabled: true,
+            server_fingerprint: Some(fingerprint),
+        },
+    };
+    let endpoint = quic_endpoint(&cfg).unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(10), run_quic_once(&endpoint, cfg))
+        .await
+        .expect("timeout");
+    assert!(
+        matches!(res, Err(RunError::Fatal(_))),
+        "unexpected result: {res:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
 }

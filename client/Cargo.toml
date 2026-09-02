@@ -22,3 +22,4 @@ tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 rustls-pemfile.workspace = true
 rustls-webpki.workspace = true
+quinn.workspace = true

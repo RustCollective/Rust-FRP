@@ -1,6 +1,7 @@
 //! rfps：接入分发（控制/数据连接同端口，首帧识别）。
 
 pub mod config;
+mod quic;
 mod session;
 mod state;
 pub mod tls;
@@ -15,7 +16,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 pub use config::ServerConfig;
-use state::{AuthPolicy, ServerState};
+use state::{AuthPolicy, DataTransport, ServerState};
 
 /// 首帧（hello / conn_init）等待上限
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,7 +28,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     serve(listener, cfg).await
 }
 
-/// 在已有 listener 上服务（测试入口）
+/// 在已有 listener 上服务（测试入口）。QUIC 启用时同端口（UDP）并行监听。
 pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
     let policy = cfg
         .auth_policy()
@@ -44,6 +45,16 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
         warn!("TLS 已显式关闭（明文模式），仅建议调试使用");
         None
     };
+    // QUIC 传输（TLS 内生，不依赖 tls.enabled；证书配置仍复用 [tls]）
+    if cfg.quic.enabled {
+        let tls_for_quic = match &tls_setup {
+            Some(t) => t.clone(),
+            None => tls::setup(cfg.tls.cert.as_deref(), cfg.tls.key.as_deref())?,
+        };
+        let endpoint = quic::endpoint(&cfg, &tls_for_quic)?;
+        let quic_state = Arc::clone(&state);
+        tokio::spawn(quic::serve_quic(quic_state, endpoint));
+    }
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -87,7 +98,16 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
                     token,
                     hostname,
                 }) => {
-                    session::handle_control(state, stream, peer, version, token, hostname).await;
+                    session::handle_control(
+                        state,
+                        stream,
+                        peer,
+                        version,
+                        token,
+                        hostname,
+                        DataTransport::Tcp,
+                    )
+                    .await;
                 }
                 Ok(Message::ConnInit { conn_id, .. }) => {
                     handle_data_conn(&state, stream, conn_id);

@@ -105,31 +105,35 @@ impl ServerCertVerifier for PinningVerifier {
     }
 }
 
-/// 构建 TLS connector。
+/// 构建 rustls 客户端配置（TCP/TLS 与 QUIC 共用）。
 ///
 /// `fingerprint`：SHA256 hex（可含冒号/大小写）；None 时用系统根验证。
-pub fn connector(fingerprint: Option<&str>) -> Result<TlsConnector> {
+pub fn rustls_client_config(fingerprint: Option<&str>) -> Result<ClientConfig> {
     let builder = ClientConfig::builder();
-    let cfg = match fingerprint.map(rfp_common::normalize_fingerprint) {
+    match fingerprint.map(rfp_common::normalize_fingerprint) {
         Some(fp) if fp.len() == 64 => {
             let verifier = PinningVerifier {
                 expected: fp.into_bytes(),
             };
-            builder
+            Ok(builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(verifier))
-                .with_no_client_auth()
+                .with_no_client_auth())
         }
-        Some(_) => {
-            return Err(anyhow!(
-                "server_fingerprint 格式无效：应为 SHA256（64 个 hex 字符）"
-            ))
-        }
-        None => builder
+        Some(_) => Err(anyhow!(
+            "server_fingerprint 格式无效：应为 SHA256（64 个 hex 字符）"
+        )),
+        None => Ok(builder
             .with_root_certificates(root_store())
-            .with_no_client_auth(),
-    };
-    Ok(TlsConnector::from(Arc::new(cfg)))
+            .with_no_client_auth()),
+    }
+}
+
+/// 构建 TLS connector（TCP 路径用）。
+pub fn connector(fingerprint: Option<&str>) -> Result<TlsConnector> {
+    Ok(TlsConnector::from(Arc::new(rustls_client_config(
+        fingerprint,
+    )?)))
 }
 
 /// 系统根证书（读常见 CA bundle；自签场景反正靠 pinning）

@@ -162,6 +162,15 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// 会话的数据通道建立方式
+#[derive(Clone)]
+pub enum DataTransport {
+    /// M1 TCP：NewConnection 通知 + client 回连 + pending 匹配
+    Tcp,
+    /// M2 QUIC：server 在既有连接上 open_bi（首帧 ConnInit），无回连
+    Quic(quinn::Connection),
+}
+
 /// 一个已认证控制连接（会话）的句柄
 pub struct SessionHandle {
     pub id: String,
@@ -169,6 +178,8 @@ pub struct SessionHandle {
     pub identity: AuthIdentity,
     /// 控制通道写侧（session 循环消费）
     pub cmd_tx: mpsc::UnboundedSender<Message>,
+    /// 数据通道建立方式
+    pub data: DataTransport,
     /// 本会话注册的代理（会话结束时清理）
     pub registered: Mutex<Vec<RegisteredProxy>>,
 }

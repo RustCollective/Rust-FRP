@@ -2,6 +2,7 @@
 
 pub mod frame;
 pub mod msg;
+pub mod quic;
 
 /// 传输无关的流（明文 TcpStream 或 TlsStream）
 pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}

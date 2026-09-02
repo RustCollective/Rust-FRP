@@ -12,3 +12,4 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+quinn.workspace = true

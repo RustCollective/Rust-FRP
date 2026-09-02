@@ -26,6 +26,9 @@ pub struct ServerConfig {
     /// TLS 配置（默认开启；关闭需显式声明）
     #[serde(default)]
     pub tls: TlsConfig,
+    /// QUIC 传输（M2；默认关闭，显式开启）
+    #[serde(default)]
+    pub quic: QuicConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +55,30 @@ impl Default for TlsConfig {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuicConfig {
+    /// 默认 false；QUIC 需要安全组额外放行 UDP
+    #[serde(default)]
+    pub enabled: bool,
+    /// QUIC UDP 监听端口；缺省复用 bind_port
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_port: Option<u16>,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self { enabled: false, bind_port: None }
+    }
+}
+
+impl ServerConfig {
+    /// QUIC 实际监听端口（缺省复用 TCP bind_port，UDP/TCP 端口号不冲突）
+    pub fn quic_port(&self) -> u16 {
+        self.quic.bind_port.unwrap_or(self.bind_port)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
