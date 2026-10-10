@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "Serena": {
+      "command": "/root/.local/bin/serena",
+      "args": [
+        "start-mcp-server",
+        "--context",
+        "codebuddy",
+        "--project",
+        "/data/dev/Rust-FRP"
+      ],
+      "description": "Serena 语义代码检索与编辑工具集（LSP 驱动，项目级）"
+    }
+  }
+}
