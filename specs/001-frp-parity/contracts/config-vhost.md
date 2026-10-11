@@ -49,12 +49,21 @@ vhosts = ["*.alice.dev", "alice.example.com"]   # 现在真正参与 http/https 
 
 ### 1.3 启动期校验（失败即拒绝启动）
 
-| 检查 | 失败行为 |
-|---|---|
-| `[https]` 启用但 `[[certs]]` 为空 | 拒绝启动，提示 TLS 监听无可用证书 |
-| 证书与私钥不配对 / PEM 解析失败 | 拒绝启动，指明出问题的 `domain` |
-| `subdomain_host` 与某个精确注册域名同形 | 拒绝启动，避免匹配歧义 |
-| `[http]`/`[https]` 端口与 `bind_port` 或已注册端口冲突 | 拒绝启动 |
+| 检查 | 失败行为 | 实现位置 |
+|---|---|---|
+| `[https]` 启用但 `[[certs]]` 为空 | 拒绝启动，提示 TLS 监听无可用证书 | `server/src/config.rs::validate` |
+| 监听端口互斥：`bind_port` / `[http]` / `[https]` 三者两两不同 | 拒绝启动，指明冲突的端口 | `server/src/config.rs::validate` |
+| `[[certs]]` 的 `domain` 归一化后为空或重复（大小写不敏感） | 拒绝启动，指明重复的域名 | `server/src/config.rs::validate` |
+| `[[certs]]` 的 `cert` / `key` 路径为空 | 拒绝启动 | `server/src/config.rs::validate` |
+| `subdomain_host` 为空或含通配符 | 拒绝启动（通配后缀会让路由匹配歧义） | `server/src/config.rs::validate` |
+| 证书文件不存在 / PEM 解析失败 / 证书与私钥不配对 | 拒绝启动，指明出问题的 `domain` | `server/src/vhost/certs.rs`（S1/T034） |
+
+校验分两处但同属"启动期"：结构性问题在 `config.rs` 的解析后校验里拦，
+需要真实读取 PEM 的问题在 `vhost/certs.rs` 构建证书表时拦。
+
+**不属启动期校验**：`subdomain_host` 展开后的域名与另一会话的精确域名同形——
+注册时才知道有哪些域名，因此由**运行期注册冲突检查**捕获（§1.2 的域名冲突路径），
+不在启动期做。
 
 ## 2. 客户端 `rfpc.toml`
 

@@ -27,11 +27,11 @@ description: "Task list for 001-frp-parity"
 
 **Purpose**: 依赖引入与模块骨架，全部故事共享
 
-- [ ] T001 在 `Cargo.toml` 的 `[workspace.dependencies]` 新增 `hyper` 1.x、`hyper-util` 0.1.x、`http` 1.x、`http-body-util` 0.1.x（research.md D9 已确认本机缓存可得）
-- [ ] T002 [P] 在 `server/Cargo.toml` 引用 T001 新增的四个依赖（用 `workspace = true`）
-- [ ] T003 [P] 在 `client/Cargo.toml` 引用 T001 新增的四个依赖（用 `workspace = true`）
-- [ ] T004 [P] 在 `client/src/lib.rs` 声明 `pub mod forward;` 与在 `client/src/main.rs` 声明对应模块（宪法附加约束：注释与文档使用中文）
-- [ ] T005 在 `server/src/lib.rs` 声明 `pub mod vhost;`，创建 `server/src/vhost/mod.rs` 空模块骨架，`cargo check --workspace` 通过
+- [x] T001 在 `Cargo.toml` 的 `[workspace.dependencies]` 新增 `hyper` 1.x、`hyper-util` 0.1.x、`http` 1.x、`http-body-util` 0.1.x（research.md D9 已确认本机缓存可得）
+- [x] T002 [P] 在 `server/Cargo.toml` 引用 T001 新增的四个依赖（用 `workspace = true`）
+- [x] T003 [P] 在 `client/Cargo.toml` 引用 T001 新增的四个依赖（用 `workspace = true`）
+- [x] T004 [P] 在 `client/src/lib.rs` 声明 `pub mod forward;` 与在 `client/src/main.rs` 声明对应模块（宪法附加约束：注释与文档使用中文）
+- [x] T005 在 `server/src/lib.rs` 声明 `pub mod vhost;`，创建 `server/src/vhost/mod.rs` 空模块骨架，`cargo check --workspace` 通过
 
 **Checkpoint**: `cargo check --workspace` 与 `cargo test --workspace` 全绿（基线 23 项无回归）
 
@@ -41,23 +41,23 @@ description: "Task list for 001-frp-parity"
 
 **Purpose**: 协议层与配置层的共用改动。**⚠️ 本阶段完成前任何用户故事都无法开工**
 
-- [ ] T006 在 `common/src/msg.rs` 新增 `HttpInit` 结构体：`method: String`、`path: String`（含 query）、`version: String`、`headers: Vec<(String, String)>`（**有序，保留重复头**，见 data-model.md §4.1）
-- [ ] T007 在 `common/src/msg.rs` 新增 `Message::HttpResponseMeta { conn_id: u64, status: u16, headers: Vec<(String, String)> }` 变体（data-model.md §4.2）
-- [ ] T008 在 `common/src/msg.rs` 为 `Message::RegisterProxy` 新增可选字段 `vhosts: Vec<String>` 与 `subdomain: Option<String>`（`#[serde(default, skip_serializing_if)]`，次号演进，主号保持 `1.0`）
-- [ ] T009 在 `common/src/msg.rs` 为 `Message::NewConnection`（M1 路径）与 `Message::ConnInit`（M2 路径）新增可选字段 `http: Option<HttpInit>`（contracts/rfp1-http-vhost.md §3.1）
-- [ ] T010 [P] 在 `common/src/msg.rs` 的 `#[cfg(test)] mod tests` 新增：`HttpInit` 与 `HttpResponseMeta` 的 roundtrip、含 `http` 字段的 `ConnInit`/`NewConnection` roundtrip、**不含新字段的旧格式报文可被解析**（向后兼容）
-- [ ] T011 [P] 在 `common/src/msg.rs` 测试中新增头字段边界用例：空 header 列表、含重复 header 名、含非 ASCII 值的 roundtrip
-- [ ] T012 在 `server/src/state.rs` 的 `Registry` 新增 `by_vhost_exact: HashMap<String, Arc<SessionHandle>>` 与 `by_vhost_wildcard: HashMap<String, Arc<SessionHandle>>` 两张表（data-model.md §3）
-- [ ] T013 在 `server/src/state.rs` 新增 `normalize_host()`：ASCII 小写、剥离 `:` 之后的部分、剥离末尾 `.`；**注册侧与查询侧必须共用同一实现**（contracts/rfp1-http-vhost.md §5 的 Normative 条款）
-- [ ] T014 [P] 在 `server/src/state.rs` 的 `#[cfg(test)] mod tests` 新增 `normalize_host()` 单测：大小写、带端口、带末尾点、含非 ASCII、空串
-- [ ] T015 在 `server/src/state.rs` 的 `cleanup_session` 中同步清理 `by_vhost_exact` / `by_vhost_wildcard`，沿用既有"只清理仍归属本会话的表项"判定（`s.id == session.id`）
-- [ ] T016 在 `server/src/config.rs` 新增 `[http]`（`bind_port`、可选 `bind_addr`）与 `[https]`（同）两个段，均缺省不启用
-- [ ] T017 在 `server/src/config.rs` 新增 `subdomain_host: Option<String>` 与 `certs: Vec<CertEntry>`（`domain` / `cert` / `key` 三个字段）
-- [ ] T018 在 `server/src/config.rs` 实现启动期校验（contracts/config-vhost.md §1.3）：`[https]` 启用但 `certs` 为空 → 拒绝启动；证书与私钥不配对 / PEM 解析失败 → 拒绝启动并指明 `domain`；`subdomain_host` 与某精确域名同形 → 拒绝启动；端口与 `bind_port` 或已注册端口冲突 → 拒绝启动
-- [ ] T019 [P] 在 `server/src/config.rs` 的测试模块新增上述四条启动校验的正反用例
-- [ ] T020 在 `client/src/config.rs` 为代理配置新增 `custom_domains: Vec<String>`、`subdomain: Option<String>`、`[proxies.local_tls]`（`enabled` / `verify` / `fingerprint`）
-- [ ] T021 在 `client/src/config.rs` 实现启动期校验（contracts/config-vhost.md §2.3）：`http`/`https` 类型下 `custom_domains` 与 `subdomain` 至少一项非空且 `remote_port` 必须为空；`tcp`/`udp` 类型下二者必须为空；`verify = "fingerprint"` 时必须给 `fingerprint`
-- [ ] T022 [P] 在 `client/src/config.rs` 的测试模块新增上述校验的正反用例
+- [x] T006 在 `common/src/msg.rs` 新增 `HttpInit` 结构体：`method: String`、`path: String`（含 query）、`version: String`、`headers: Vec<(String, String)>`（**有序，保留重复头**，见 data-model.md §4.1）
+- [x] T007 在 `common/src/msg.rs` 新增 `Message::HttpResponseMeta { conn_id: u64, status: u16, headers: Vec<(String, String)> }` 变体（data-model.md §4.2）
+- [x] T008 在 `common/src/msg.rs` 为 `Message::RegisterProxy` 新增可选字段 `vhosts: Vec<String>` 与 `subdomain: Option<String>`（`#[serde(default, skip_serializing_if)]`，次号演进，主号保持 `1.0`）
+- [x] T009 在 `common/src/msg.rs` 为 `Message::NewConnection`（M1 路径）与 `Message::ConnInit`（M2 路径）新增可选字段 `http: Option<HttpInit>`（contracts/rfp1-http-vhost.md §3.1）
+- [x] T010 [P] 在 `common/src/msg.rs` 的 `#[cfg(test)] mod tests` 新增：`HttpInit` 与 `HttpResponseMeta` 的 roundtrip、含 `http` 字段的 `ConnInit`/`NewConnection` roundtrip、**不含新字段的旧格式报文可被解析**（向后兼容）
+- [x] T011 [P] 在 `common/src/msg.rs` 测试中新增头字段边界用例：空 header 列表、含重复 header 名、含非 ASCII 值的 roundtrip
+- [x] T012 在 `server/src/state.rs` 的 `Registry` 新增 `by_vhost_exact: HashMap<String, Arc<SessionHandle>>` 与 `by_vhost_wildcard: HashMap<String, Arc<SessionHandle>>` 两张表（data-model.md §3）
+- [x] T013 在 `server/src/state.rs` 新增 `normalize_host()`：ASCII 小写、剥离 `:` 之后的部分、剥离末尾 `.`；**注册侧与查询侧必须共用同一实现**（contracts/rfp1-http-vhost.md §5 的 Normative 条款）
+- [x] T014 [P] 在 `server/src/state.rs` 的 `#[cfg(test)] mod tests` 新增 `normalize_host()` 单测：大小写、带端口、带末尾点、含非 ASCII、空串
+- [x] T015 在 `server/src/state.rs` 的 `cleanup_session` 中同步清理 `by_vhost_exact` / `by_vhost_wildcard`，沿用既有"只清理仍归属本会话的表项"判定（`s.id == session.id`）
+- [x] T016 在 `server/src/config.rs` 新增 `[http]`（`bind_port`、可选 `bind_addr`）与 `[https]`（同）两个段，均缺省不启用
+- [x] T017 在 `server/src/config.rs` 新增 `subdomain_host: Option<String>` 与 `certs: Vec<CertEntry>`（`domain` / `cert` / `key` 三个字段）
+- [x] T018 在 `server/src/config.rs` 实现启动期校验（contracts/config-vhost.md §1.3）：`[https]` 启用但 `certs` 为空 → 拒绝启动；证书与私钥不配对 / PEM 解析失败 → 拒绝启动并指明 `domain`；`subdomain_host` 与某精确域名同形 → 拒绝启动；端口与 `bind_port` 或已注册端口冲突 → 拒绝启动
+- [x] T019 [P] 在 `server/src/config.rs` 的测试模块新增上述四条启动校验的正反用例
+- [x] T020 在 `client/src/config.rs` 为代理配置新增 `custom_domains: Vec<String>`、`subdomain: Option<String>`、`[proxies.local_tls]`（`enabled` / `verify` / `fingerprint`）
+- [x] T021 在 `client/src/config.rs` 实现启动期校验（contracts/config-vhost.md §2.3）：`http`/`https` 类型下 `custom_domains` 与 `subdomain` 至少一项非空且 `remote_port` 必须为空；`tcp`/`udp` 类型下二者必须为空；`verify = "fingerprint"` 时必须给 `fingerprint`
+- [x] T022 [P] 在 `client/src/config.rs` 的测试模块新增上述校验的正反用例
 
 **Checkpoint**: 协议与配置层就绪，`cargo test --workspace` 全绿；**此阶段收尾执行一次提交**（宪法原则 I）
 
@@ -99,8 +99,8 @@ description: "Task list for 001-frp-parity"
 - [ ] T043 [US1] 在 `client/src/lib.rs` 实现接收分派：识别 `http` 元数据（M1 来自 `new_connection`、M2 来自 `conn_init` 首帧），交由 `forward` 模块处理
 - [ ] T044 [US1] 在 `client/src/forward.rs` 实现请求转发：按 `HttpInit` 构造 HTTP/1.1 请求发往 `local_addr`；`[proxies.local_tls].enabled = true` 时用 TLS（`verify` 为 `system` 时用系统根、`skip` 时跳过并在日志以 warn 提示）——research.md D8
 - [ ] T045 [US1] 在 `client/src/forward.rs` 实现响应回传：在数据流上写 `http_response_meta` 作为**该方向第一条消息**，随后写裸响应体至半关闭（data-model.md §4.3）
-- [ ] T046 [US1] 在 `client/src/main.rs` 移除启动期"非 Tcp 一律拒绝"的检查（`client/src/main.rs:34`），改为调用 T021 的类型化校验
-- [ ] T047 [US1] 在 `client/src/lib.rs` 修正 `register_proxy` 的 `vhost: None` 硬编码（`client/src/lib.rs:149`），改为透传配置中的 `custom_domains` / `subdomain`
+- [x] T046 [US1] 在 `client/src/main.rs` 移除启动期"非 Tcp 一律拒绝"的检查（`client/src/main.rs:34`），改为调用 T021 的类型化校验
+- [x] T047 [US1] 在 `client/src/lib.rs` 修正 `register_proxy` 的 `vhost: None` 硬编码（`client/src/lib.rs:149`），改为透传配置中的 `custom_domains` / `subdomain`
 - [ ] T048 [US1] 在 `server/src/lib.rs` 接线：按配置在启动时拉起 `vhost::mod` 的监听任务，与既有控制面共用 `ServerState`
 - [ ] T049 [US1] 在 `server/src/vhost/proxy.rs` 与 `client/src/forward.rs` 补齐 tracing：info 记代理名/域名/状态码/字节数，debug 记元数据帧内容（宪法附加约束的日志约定）
 
