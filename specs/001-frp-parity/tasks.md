@@ -107,8 +107,8 @@ description: "Task list for 001-frp-parity"
 ### Verification for User Story 1
 
 - [x] T050 [US1] 跑 [quickstart.md](./quickstart.md) 第 2 节门禁：`cargo test --workspace` 全绿且既有 23 项无回归（SC-003）
-- [ ] T051 [US1] 部署到上游并按 quickstart 4.1 重启两侧服务；确认上游需先放行 vhost 端口（宪法原则 II 的环境前置），并把新端口写入 `docs/CONVENTIONS.md` 的「公网部署状态」
-- [ ] T052 [US1] 按 `specs/001-frp-parity/quickstart.md` 4.2–4.6 在真实链路上验收场景 A–E，**4.3 禁止用 `-k` 跳过证书校验**
+- [x] T051 [US1] 部署到上游并按 quickstart 4.1 重启两侧服务；确认上游需先放行 vhost 端口（宪法原则 II 的环境前置），并把新端口写入 `docs/CONVENTIONS.md` 的「公网部署状态」
+- [x] T052 [US1] 按 `specs/001-frp-parity/quickstart.md` 4.2–4.6 在真实链路上验收场景 A–E，**4.3 禁止用 `-k` 跳过证书校验**
 - [ ] T053 [US1] 按 `specs/001-frp-parity/quickstart.md` 4.7 验收流式转发：1GB 与 1MB 下载下上游 rfps 的 RSS 增量处于同一量级（SC-007）
 - [ ] T054 [US1] 按 `specs/001-frp-parity/quickstart.md` 4.8 验收延迟：P95 附加延迟 < 50ms（SC-004）
 - [ ] T055 [US1] 回填 [research.md](./research.md) 的「遗留待验证项」1–3；若 auto builder 的 h2c 协商实测退化，明确"明文端口仅 h1.1、TLS 端口 h1+h2"并同步 spec 与 contracts
@@ -312,3 +312,22 @@ US1 完成后即具备 M3（HTTP/3 网关）的起步条件——`vhost::router`
 - **宪法原则 II**：T051/T066/T081/T090/T100 的"真实链路验收"是本机 rfpc ↔ 上游 rfps，本机自环只作回归
 - **宪法原则 V**：不得为了省事改 `conn_id` 分配、加连接池、引入隧道内 L7 编解码层
 - 实现前先看 [research.md](./research.md) 的决策与**被否决方案**，避免重复讨论
+
+---
+
+## Phase 9: Convergence（真实链路验收暴露的问题）
+
+**来源**：2026-10-12 上游真实链路验收。证据见 [research.md](./research.md) D11。
+
+- [ ] T108 修订 `contracts/rfp1-http-vhost.md` §3.3 与 `data-model.md` §4.3：把
+      "半关闭即体结束"改为显式分帧（`HttpInit 帧 → N 个长度前缀体帧 → 0 长度帧`，
+      响应方向同构），并说明为何不再依赖半关闭
+- [ ] T109 按修订后的契约改 `server/src/vhost/proxy.rs`（请求方向分帧 + 不再提前
+      shutdown；响应方向分帧收尾）
+- [ ] T110 按修订后的契约改 `client/src/forward.rs`（两个方向都按帧收发；写完后
+      等对端关闭连接再释放 socket，关闭时不得有在途数据）
+- [ ] T111 在 `server/tests/e2e.rs` 增加"大响应不截断"回归用例（≥8 MiB，逐字节校验
+      长度），并断言客户端关闭前对端已读完
+- [ ] T112 重跑 T053（流式/SC-007）与 T054（延迟/SC-004）的上游真实链路验收
+- [ ] T113 验收通过后清理上游的验收遗留：删除临时 nginx 站点文件并 reload、
+      按需移除 `rfps.toml` 中的 `[http]`/`[https]`/`[[certs]]` 与 65532 端口授权

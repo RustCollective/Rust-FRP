@@ -52,10 +52,20 @@
 
 宪法「开发工作流与验证环境」声明**本节是部署事实的唯一权威来源**，任何部署变更必须同轮更新本节。
 
-- tryanderror.cn（103.119.1.117，SSH 见 ~/.ssh/tryanderror.cn）：rfps M2 版已部署（/opt/rust-frp，
-  systemd `rfps.service`），TCP+UDP 10085 双监听，`[quic] enabled = true`，
-  旧版备份 rfps.bak-m1。fingerprint：603d904eb2beebbe2b60a3735191275b27907609deecf5d4cfcb3fa58e9363a5
+- tryanderror.cn（103.119.1.117，SSH 见 `~/.ssh/tryanderror.cn`，端口 60304）：
+  rfps **S1 版**已部署（/opt/rust-frp，systemd `rfps.service`），
+  TCP+UDP 10085 双监听，`[quic] enabled = true`，`[http] 8080` + `[https] 18443`，
+  `subdomain_host = "tryanderror.cn"`。备份：`rfps.bak-m2`、`rfps.bak-m1`（+ 对应 toml）
+  fingerprint（未变）：603d904eb2beebbe2b60a3735191275b27907609deecf5d4cfcb3fa58e9363a5
+- vhost 证书：`/opt/rust-frp/certs/rfp-test.crt|.key`（自签，CN/SAN = rfp-test.tryanderror.cn）
+- **安全组只放行这些端口**（2026-10-12 实测；其余一律 TIMEOUT 被上游设备丢弃）：
+  TCP 60304（SSH）、TCP 10085（控制）、TCP 65533（生产代理）、TCP 80、TCP 443。
+  **8080 / 18443 未放行**，因此 vhost 验收经上游 nginx 前端转发：
+  `/www/server/panel/vhost/nginx/rfp-test.tryanderror.cn.conf`（临时文件，验收结束删除并 reload）。
+  注意 80/443/8443 均被 nginx 占用（BT 面板托管，主配置 /www/server/nginx/conf/nginx.conf）
+- 通配 DNS：`*.tryanderror.cn` → 103.119.1.117（子域名可直接解析）
+- 测试用户 `msi-main` 端口授权为 `["65533", "65532"]`（65532 供 tcp 对照组用）
 - 生产隧道：jyutyu.cn（discourse-https，端口 65533，本机 rfpc systemd 服务，TCP 传输）
-- 公网 QUIC 验证：**待安全组放行 UDP 10085**（tcpdump 确认当前被拦截；该机为 Cloudie 香港 VPS，
-  无阿里云 API 可用——Rock5B 上的 acme.sh 阿里云密钥已失效）
-- 安全组已放行：TCP 10085（控制）、TCP 65533（代理）
+- 公网 QUIC 验证：**仍待安全组放行 UDP 10085**（tcpdump 实测 3 个探测包 0 命中；
+  该机为 Cloudie 香港 VPS 面板管控，无 API 可用）
+- 本机验收客户端：`/tmp/rfpc-s1-accept.toml`（独立进程，不经过 `rfpc.service`）
