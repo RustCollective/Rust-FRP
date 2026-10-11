@@ -73,40 +73,40 @@ description: "Task list for 001-frp-parity"
 
 > **NOTE: 先写测试并确认失败，再进入实现**
 
-- [ ] T023 [P] [US1] 在 `server/tests/e2e.rs` 新增 vhost 明文路由 e2e：起 rfps（启用 `[http]`）+ rfpc，用 `Host` 头访问，断言内容来自本地 origin
-- [ ] T024 [P] [US1] 在 `server/tests/e2e.rs` 新增 HTTPS SNI 终止 e2e：用测试证书起 `[https]`，用 rustls 客户端以 SNI 连接，断言握手成功且收到 200
-- [ ] T025 [P] [US1] 在 `server/tests/e2e.rs` 新增未注册域名 e2e：断言返回 404，且客户端侧无任何转发记录
-- [ ] T026 [P] [US1] 在 `server/tests/e2e.rs` 新增域名冲突 e2e：第二个会话注册同域名，断言 `RegisterProxyAck.ok=false` 且携带冲突域名，先注册者访问仍正常
-- [ ] T027 [P] [US1] 在 `server/tests/e2e.rs` 新增转发头 e2e：断言 origin 侧收到 `X-Forwarded-For`（访客地址，非 loopback）与 `X-Forwarded-Proto`
-- [ ] T028 [P] [US1] 在 `server/tests/e2e.rs` 新增未配置 vhost 监听端口时注册失败的 e2e（spec 边界情形）
-- [ ] T029 [P] [US1] 在 `server/tests/e2e.rs` 新增授权失败 e2e：用户模式下的域名不在 `vhosts` 授权范围，断言注册被拒且原因复用既有措辞
+- [x] T023 [P] [US1] 在 `server/tests/e2e.rs` 新增 vhost 明文路由 e2e：起 rfps（启用 `[http]`）+ rfpc，用 `Host` 头访问，断言内容来自本地 origin
+- [x] T024 [P] [US1] 在 `server/tests/e2e.rs` 新增 HTTPS SNI 终止 e2e：用测试证书起 `[https]`，用 rustls 客户端以 SNI 连接，断言握手成功且收到 200
+- [x] T025 [P] [US1] 在 `server/tests/e2e.rs` 新增未注册域名 e2e：断言返回 404，且客户端侧无任何转发记录
+- [x] T026 [P] [US1] 在 `server/tests/e2e.rs` 新增域名冲突 e2e：第二个会话注册同域名，断言 `RegisterProxyAck.ok=false` 且携带冲突域名，先注册者访问仍正常
+- [x] T027 [P] [US1] 在 `server/tests/e2e.rs` 新增转发头 e2e：断言 origin 侧收到 `X-Forwarded-For`（访客地址，非 loopback）与 `X-Forwarded-Proto`
+- [x] T028 [P] [US1] 在 `server/tests/e2e.rs` 新增未配置 vhost 监听端口时注册失败的 e2e（spec 边界情形）
+- [x] T029 [P] [US1] 在 `server/tests/e2e.rs` 新增授权失败 e2e：用户模式下的域名不在 `vhosts` 授权范围，断言注册被拒且原因复用既有措辞
 
 ### Implementation for User Story 1
 
-- [ ] T030 [P] [US1] 在 `server/src/vhost/router.rs` 实现路由查询：归一化 host 后先查 `exact` 再查 `wildcard`；wildcard 命中要求 `<label>.<后缀>` 且 `<label>` 非空、不含点；两级皆未中返回 `None`（data-model.md §3）
-- [ ] T031 [P] [US1] 在 `server/src/vhost/router.rs` 的测试模块新增匹配语义单测：精确优先于通配、`evil-alice.dev` 不匹配 `*.alice.dev`、`x.alice.dev` 匹配、`a.b.alice.dev` 不匹配、裸域不匹配通配
-- [ ] T032 [US1] 在 `server/src/state.rs` 实现域名注册路径：对 `vhost` / `vhosts` / `subdomain`（展开为 `<subdomain>.<subdomain_host>`）逐一走 `authorize_vhost()`、逐域名冲突检查、然后原子登记到两张表（依赖 T013、T016、T017）
-- [ ] T033 [US1] 在 `server/src/session.rs` 的 `register_proxy` 分派中移除 `if proxy_type != ProxyType::Tcp` 的一律拒绝（`server/src/session.rs:177`），改为按类型校验：`Http`/`Https` 要求 `remote_port` 为空且域名至少一项、要求对应监听端口已配置；错误原因按 contracts/rfp1-http-vhost.md §2 的表格分列
-- [ ] T034 [US1] 在 `server/src/vhost/certs.rs` 实现 rustls `ResolvesServerCert`：按 ClientHello 的 SNI 查证书表；**未命中一律拒绝握手，不回落默认证书**（research.md D4）
-- [ ] T035 [P] [US1] 在 `server/src/vhost/certs.rs` 的测试模块新增单测：命中精确域名、命中通配证书、未命中返回 `None`
-- [ ] T036 [US1] 在 `server/src/vhost/proxy.rs` 实现请求侧处理：剥离逐跳头（`connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`te`、`trailer`、`transfer-encoding`、`upgrade`，以及 `connection` 中列出的自定义扩展头），**追加**（非覆盖）`x-forwarded-for` 与 `x-forwarded-proto`（research.md D7）
-- [ ] T037 [P] [US1] 在 `server/src/vhost/proxy.rs` 的测试模块新增逐跳头剥离与转发头追加的单测，含"已存在 `x-forwarded-for` 时用 `, ` 追加"的用例
-- [ ] T038 [US1] 在 `server/src/vhost/proxy.rs` 实现流式双向管道：请求体从 hyper 的 body 逐块读出直写隧道流，响应体用适配器把隧道读端包成 `hyper::body::Body`。**MUST NOT 整体缓冲，MUST NOT 在中间引入无界 channel**（research.md D6、FR-011、SC-007）
-- [ ] T039 [US1] 在 `server/src/vhost/proxy.rs` 实现错误响应：域名未命中或 `kind` 与监听端口不匹配 → 404 且不回落；元数据帧超 64 KiB → 4xx 且不断开控制通道；客户端本地服务拒绝连接 → 502（contracts/rfp1-http-vhost.md §5）
-- [ ] T040 [US1] 在 `server/src/vhost/mod.rs` 装配监听：`[http]` 用 `hyper_util::server::conn::auto::Builder` 自动协商 h1 与 h2c；`[https]` 用 `tokio-rustls` + T034 的证书解析 + 同一 auto builder
-- [ ] T041 [US1] 在 `server/src/session.rs` 的 M1 路径扩展 `new_connection`：`http` 类型代理在通知中携带 `HttpInit`，随后照旧等待 client 回连（contracts §3.1）
-- [ ] T042 [US1] 在 `server/src/quic.rs` 的 M2 路径：`open_bi` 后写入携带 `HttpInit` 的 `conn_init` 首帧，再进入裸字节转发
-- [ ] T043 [US1] 在 `client/src/lib.rs` 实现接收分派：识别 `http` 元数据（M1 来自 `new_connection`、M2 来自 `conn_init` 首帧），交由 `forward` 模块处理
-- [ ] T044 [US1] 在 `client/src/forward.rs` 实现请求转发：按 `HttpInit` 构造 HTTP/1.1 请求发往 `local_addr`；`[proxies.local_tls].enabled = true` 时用 TLS（`verify` 为 `system` 时用系统根、`skip` 时跳过并在日志以 warn 提示）——research.md D8
-- [ ] T045 [US1] 在 `client/src/forward.rs` 实现响应回传：在数据流上写 `http_response_meta` 作为**该方向第一条消息**，随后写裸响应体至半关闭（data-model.md §4.3）
+- [x] T030 [P] [US1] 在 `server/src/vhost/router.rs` 实现路由查询：归一化 host 后先查 `exact` 再查 `wildcard`；wildcard 命中要求 `<label>.<后缀>` 且 `<label>` 非空、不含点；两级皆未中返回 `None`（data-model.md §3）
+- [x] T031 [P] [US1] 在 `server/src/vhost/router.rs` 的测试模块新增匹配语义单测：精确优先于通配、`evil-alice.dev` 不匹配 `*.alice.dev`、`x.alice.dev` 匹配、`a.b.alice.dev` 不匹配、裸域不匹配通配
+- [x] T032 [US1] 在 `server/src/state.rs` 实现域名注册路径：对 `vhost` / `vhosts` / `subdomain`（展开为 `<subdomain>.<subdomain_host>`）逐一走 `authorize_vhost()`、逐域名冲突检查、然后原子登记到两张表（依赖 T013、T016、T017）
+- [x] T033 [US1] 在 `server/src/session.rs` 的 `register_proxy` 分派中移除 `if proxy_type != ProxyType::Tcp` 的一律拒绝（`server/src/session.rs:177`），改为按类型校验：`Http`/`Https` 要求 `remote_port` 为空且域名至少一项、要求对应监听端口已配置；错误原因按 contracts/rfp1-http-vhost.md §2 的表格分列
+- [x] T034 [US1] 在 `server/src/vhost/certs.rs` 实现 rustls `ResolvesServerCert`：按 ClientHello 的 SNI 查证书表；**未命中一律拒绝握手，不回落默认证书**（research.md D4）
+- [x] T035 [P] [US1] 在 `server/src/vhost/certs.rs` 的测试模块新增单测：命中精确域名、命中通配证书、未命中返回 `None`
+- [x] T036 [US1] 在 `server/src/vhost/proxy.rs` 实现请求侧处理：剥离逐跳头（`connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`te`、`trailer`、`transfer-encoding`、`upgrade`，以及 `connection` 中列出的自定义扩展头），**追加**（非覆盖）`x-forwarded-for` 与 `x-forwarded-proto`（research.md D7）
+- [x] T037 [P] [US1] 在 `server/src/vhost/proxy.rs` 的测试模块新增逐跳头剥离与转发头追加的单测，含"已存在 `x-forwarded-for` 时用 `, ` 追加"的用例
+- [x] T038 [US1] 在 `server/src/vhost/proxy.rs` 实现流式双向管道：请求体从 hyper 的 body 逐块读出直写隧道流，响应体用适配器把隧道读端包成 `hyper::body::Body`。**MUST NOT 整体缓冲，MUST NOT 在中间引入无界 channel**（research.md D6、FR-011、SC-007）
+- [x] T039 [US1] 在 `server/src/vhost/proxy.rs` 实现错误响应：域名未命中或 `kind` 与监听端口不匹配 → 404 且不回落；元数据帧超 64 KiB → 4xx 且不断开控制通道；客户端本地服务拒绝连接 → 502（contracts/rfp1-http-vhost.md §5）
+- [x] T040 [US1] 在 `server/src/vhost/mod.rs` 装配监听：`[http]` 用 `hyper_util::server::conn::auto::Builder` 自动协商 h1 与 h2c；`[https]` 用 `tokio-rustls` + T034 的证书解析 + 同一 auto builder
+- [x] T041 [US1] 在 `server/src/session.rs` 的 M1 路径扩展 `new_connection`：`http` 类型代理在通知中携带 `HttpInit`，随后照旧等待 client 回连（contracts §3.1）
+- [x] T042 [US1] 在 `server/src/quic.rs` 的 M2 路径：`open_bi` 后写入携带 `HttpInit` 的 `conn_init` 首帧，再进入裸字节转发
+- [x] T043 [US1] 在 `client/src/lib.rs` 实现接收分派：识别 `http` 元数据（M1 来自 `new_connection`、M2 来自 `conn_init` 首帧），交由 `forward` 模块处理
+- [x] T044 [US1] 在 `client/src/forward.rs` 实现请求转发：按 `HttpInit` 构造 HTTP/1.1 请求发往 `local_addr`；`[proxies.local_tls].enabled = true` 时用 TLS（`verify` 为 `system` 时用系统根、`skip` 时跳过并在日志以 warn 提示）——research.md D8
+- [x] T045 [US1] 在 `client/src/forward.rs` 实现响应回传：在数据流上写 `http_response_meta` 作为**该方向第一条消息**，随后写裸响应体至半关闭（data-model.md §4.3）
 - [x] T046 [US1] 在 `client/src/main.rs` 移除启动期"非 Tcp 一律拒绝"的检查（`client/src/main.rs:34`），改为调用 T021 的类型化校验
 - [x] T047 [US1] 在 `client/src/lib.rs` 修正 `register_proxy` 的 `vhost: None` 硬编码（`client/src/lib.rs:149`），改为透传配置中的 `custom_domains` / `subdomain`
-- [ ] T048 [US1] 在 `server/src/lib.rs` 接线：按配置在启动时拉起 `vhost::mod` 的监听任务，与既有控制面共用 `ServerState`
-- [ ] T049 [US1] 在 `server/src/vhost/proxy.rs` 与 `client/src/forward.rs` 补齐 tracing：info 记代理名/域名/状态码/字节数，debug 记元数据帧内容（宪法附加约束的日志约定）
+- [x] T048 [US1] 在 `server/src/lib.rs` 接线：按配置在启动时拉起 `vhost::mod` 的监听任务，与既有控制面共用 `ServerState`
+- [x] T049 [US1] 在 `server/src/vhost/proxy.rs` 与 `client/src/forward.rs` 补齐 tracing：info 记代理名/域名/状态码/字节数，debug 记元数据帧内容（宪法附加约束的日志约定）
 
 ### Verification for User Story 1
 
-- [ ] T050 [US1] 跑 [quickstart.md](./quickstart.md) 第 2 节门禁：`cargo test --workspace` 全绿且既有 23 项无回归（SC-003）
+- [x] T050 [US1] 跑 [quickstart.md](./quickstart.md) 第 2 节门禁：`cargo test --workspace` 全绿且既有 23 项无回归（SC-003）
 - [ ] T051 [US1] 部署到上游并按 quickstart 4.1 重启两侧服务；确认上游需先放行 vhost 端口（宪法原则 II 的环境前置），并把新端口写入 `docs/CONVENTIONS.md` 的「公网部署状态」
 - [ ] T052 [US1] 按 `specs/001-frp-parity/quickstart.md` 4.2–4.6 在真实链路上验收场景 A–E，**4.3 禁止用 `-k` 跳过证书校验**
 - [ ] T053 [US1] 按 `specs/001-frp-parity/quickstart.md` 4.7 验收流式转发：1GB 与 1MB 下载下上游 rfps 的 RSS 增量处于同一量级（SC-007）
