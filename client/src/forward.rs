@@ -18,7 +18,7 @@ use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use rfp_common::frame::write_frame;
+use rfp_common::frame::{read_frame, write_frame, MAX_FRAME};
 use rfp_common::msg::{HttpInit, Message};
 use rfp_common::BoxedStream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -27,6 +27,9 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::config::{LocalTlsConfig, LocalTlsVerify, ProxyConfig};
+
+/// UDP 数据报读取缓冲：UDP 理论最大载荷 65507，取 64 KiB 足够
+const DATAGRAM_MAX: usize = 64 * 1024;
 
 /// 隧道的请求元数据 → 本地服务 → 响应回写。
 ///
@@ -109,6 +112,57 @@ where
         }
     }
     let _ = wr.shutdown().await;
+    Ok(())
+}
+
+/// UDP 代理的转发：每个会话一个本地 UDP socket，隧道内数据报保持边界（S2）。
+///
+/// 承载见 `specs/001-frp-parity/research.md` D10：一条会话对应一条隧道流，
+/// 流内每个数据报是一个 RFP/1 长度前缀帧——与请求/响应元数据帧同一套编解码，
+/// 不引入新的协议层。
+pub async fn forward_udp<S>(proxy: &ProxyConfig, stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let local = tokio::net::UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("绑定本地 UDP socket 失败")?;
+    local
+        .connect(proxy.local_addr.as_str())
+        .await
+        .with_context(|| format!("连接本地 UDP 服务 {} 失败", proxy.local_addr))?;
+
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let mut buf = vec![0u8; DATAGRAM_MAX];
+
+    // 本地 → 隧道
+    let up = async {
+        // 零长数据报是合法的：`while let Ok` 不会把它当成结束
+        while let Ok(n) = local.recv(&mut buf).await {
+            // 与 server 侧同款防御：超上限明确丢弃并告警，不截断（FR-016）
+            if n > MAX_FRAME {
+                warn!(len = n, "数据报超出单帧上限，已丢弃（不截断）");
+                continue;
+            }
+            if write_frame(&mut wr, &buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        let _ = wr.shutdown().await;
+    };
+    // 隧道 → 本地
+    let down = async {
+        while let Ok(payload) = read_frame(&mut rd).await {
+            if local.send(&payload).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
+    }
     Ok(())
 }
 

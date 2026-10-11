@@ -126,12 +126,29 @@ pub struct VhostSettings {
     pub subdomain_host: Option<String>,
 }
 
+/// UDP 代理设置（S2）
+#[derive(Debug, Clone)]
+pub struct UdpSettings {
+    /// 会话空闲回收阈值
+    pub idle_timeout: std::time::Duration,
+}
+
+impl Default for UdpSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
 pub struct ServerState {
     pub policy: AuthPolicy,
     /// 代理端口监听地址
     pub bind_addr: String,
     /// vhost 网关设置（S1）
     pub vhost: VhostSettings,
+    /// UDP 代理设置（S2）
+    pub udp: UdpSettings,
     next_conn_id: AtomicU64,
     /// 注册临界区含 bind（await），用 tokio Mutex
     pub registry: tokio::sync::Mutex<Registry>,
@@ -145,6 +162,7 @@ impl ServerState {
             policy,
             bind_addr,
             vhost: VhostSettings::default(),
+            udp: UdpSettings::default(),
             next_conn_id: AtomicU64::new(1),
             registry: tokio::sync::Mutex::new(Registry::default()),
             pending: Mutex::new(HashMap::new()),
@@ -154,6 +172,12 @@ impl ServerState {
     /// 设置 vhost 网关（S1）
     pub fn with_vhost(mut self, vhost: VhostSettings) -> Self {
         self.vhost = vhost;
+        self
+    }
+
+    /// 设置 UDP 代理参数（S2）
+    pub fn with_udp(mut self, udp: UdpSettings) -> Self {
+        self.udp = udp;
         self
     }
 

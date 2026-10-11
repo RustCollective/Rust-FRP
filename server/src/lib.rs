@@ -5,6 +5,7 @@ mod quic;
 mod session;
 mod state;
 pub mod tls;
+pub mod udp;
 pub mod vhost;
 
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 pub use config::ServerConfig;
-use state::{AuthPolicy, DataTransport, ServerState, VhostSettings};
+use state::{AuthPolicy, DataTransport, ServerState, UdpSettings, VhostSettings};
 
 /// 首帧（hello / conn_init）等待上限
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,8 +48,13 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
         https: cfg.https.is_some(),
         subdomain_host: cfg.subdomain_host.clone(),
     };
+    let udp_settings = UdpSettings {
+        idle_timeout: Duration::from_secs(cfg.udp.idle_timeout_secs),
+    };
     let state = Arc::new(
-        ServerState::new(policy, cfg.bind_addr.clone()).with_vhost(vhost_settings),
+        ServerState::new(policy, cfg.bind_addr.clone())
+            .with_vhost(vhost_settings)
+            .with_udp(udp_settings),
     );
 
     // S1：vhost 明文 HTTP 监听（h1 + h2c）

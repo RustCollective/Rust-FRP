@@ -10,7 +10,7 @@ use rfp_client::{quic_endpoint, run_once, run_quic_once, RunError};
 use rfp_common::msg::ProxyType;
 
 use rfp_server::config::{
-    CertEntry, QuicConfig, ServerConfig, TlsConfig as ServerTls, UserConfig, VhostListener,
+    CertEntry, QuicConfig, ServerConfig, TlsConfig as ServerTls, UdpConfig, UserConfig, VhostListener,
 };
 use rfp_server::serve;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,6 +65,7 @@ fn test_server_config(port: u16, token: &str) -> ServerConfig {
         https: None,
         subdomain_host: None,
         certs: vec![],
+        udp: UdpConfig::default(),
     }
 }
 
@@ -173,6 +174,7 @@ fn user_server_config(port: u16) -> ServerConfig {
         https: None,
         subdomain_host: None,
         certs: vec![],
+        udp: UdpConfig::default(),
     }
 }
 
@@ -298,6 +300,7 @@ async fn tls_pinned_end_to_end() {
             https: None,
             subdomain_host: None,
             certs: vec![],
+            udp: UdpConfig::default(),
         },
     ));
 
@@ -377,6 +380,7 @@ async fn tls_wrong_fingerprint_rejected() {
             https: None,
             subdomain_host: None,
             certs: vec![],
+            udp: UdpConfig::default(),
         },
     ));
 
@@ -433,6 +437,7 @@ fn quic_server_config(srv_port: u16, cert: &str, key: &str) -> ServerConfig {
         https: None,
         subdomain_host: None,
         certs: vec![],
+        udp: UdpConfig::default(),
     }
 }
 
@@ -1021,4 +1026,189 @@ async fn vhost_quic_http_routing() {
         head.contains("x-forwarded-proto: http"),
         "origin 未收到 XFP:\n{head}"
     );
+}
+
+// ============================================================ S2：UDP 代理
+
+/// 起一个 UDP 回显服务，返回端口
+async fn spawn_udp_echo() -> u16 {
+    let sock = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = sock.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
+            let _ = sock.send_to(&buf[..n], peer).await;
+        }
+    });
+    port
+}
+
+/// 反复发包直到收到回显。
+///
+/// 会话与隧道的建立有延迟，首个数据报可能先丢——UDP 语义允许，测试必须容忍。
+async fn udp_echo_until(sock: &tokio::net::UdpSocket, payload: &[u8]) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut buf = vec![0u8; 4096];
+    while tokio::time::Instant::now() < deadline {
+        let _ = sock.send(payload).await;
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(300), sock.recv(&mut buf)).await
+        {
+            buf.truncate(n);
+            return buf;
+        }
+    }
+    panic!("UDP 回显始终未成功（payload 长度 {}）", payload.len());
+}
+
+/// UDP 代理的客户端配置（TCP 承载、明文）
+fn udp_client_config(
+    srv_port: u16,
+    name: &str,
+    origin_port: u16,
+    remote_port: u16,
+) -> ClientConfig {
+    ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Tcp,
+        token: "secret".into(),
+        proxies: vec![ProxyConfig {
+            name: name.into(),
+            proxy_type: ProxyType::Udp,
+            local_addr: format!("127.0.0.1:{origin_port}"),
+            remote_port: Some(remote_port),
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        }],
+        tls: plain_client_tls(),
+    }
+}
+
+/// T062：UDP 全链路——数据报边界、同源端口复用会话、换源端口即新会话
+#[tokio::test]
+async fn udp_proxy_end_to_end() {
+    let echo_port = spawn_udp_echo().await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(srv_listener, test_server_config(srv_port, "secret")));
+
+    let remote_port = safe_port(16600).await;
+    tokio::spawn(run_once(udp_client_config(srv_port, "udp-echo", echo_port, remote_port)));
+
+    // 源端口 A
+    let a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    a.connect(("127.0.0.1", remote_port)).await.unwrap();
+    let got = udp_echo_until(&a, b"hello-udp-a").await;
+    assert_eq!(got, b"hello-udp-a");
+
+    // 同一会话内数据报边界不粘连：连发两个不同长度的包，应收到两个独立回显
+    let _ = a.send(b"11111").await;
+    let _ = a.send(b"2222222222").await;
+    let mut sizes = Vec::new();
+    for _ in 0..2 {
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), a.recv(&mut buf))
+            .await
+            .expect("等待第二个回显超时")
+            .unwrap();
+        sizes.push(n);
+    }
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![5, 10], "数据报边界被破坏");
+
+    // 换源端口 → 另一条会话，同样可用
+    let b = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    b.connect(("127.0.0.1", remote_port)).await.unwrap();
+    let got_b = udp_echo_until(&b, b"hello-udp-b").await;
+    assert_eq!(got_b, b"hello-udp-b");
+
+    // 源 A 仍然可用（未被 B 顶掉）
+    let again = udp_echo_until(&a, b"still-a").await;
+    assert_eq!(again, b"still-a");
+}
+
+/// T063：空闲回收后，同源端口再发包应能重建会话。
+///
+/// 回收触发本身由 `udp::idle_watch` 的单测覆盖；这里覆盖"重建"这一段语义。
+#[tokio::test]
+async fn udp_session_rebuilt_after_idle() {
+    let echo_port = spawn_udp_echo().await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    // 空闲阈值压到 1s，让测试不必等默认的 60s
+    let mut cfg = test_server_config(srv_port, "secret");
+    cfg.udp = UdpConfig { idle_timeout_secs: 1 };
+    tokio::spawn(serve(srv_listener, cfg));
+
+    let remote_port = safe_port(16700).await;
+    tokio::spawn(run_once(udp_client_config(srv_port, "udp-echo", echo_port, remote_port)));
+
+    let a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    a.connect(("127.0.0.1", remote_port)).await.unwrap();
+    assert_eq!(udp_echo_until(&a, b"before-idle").await, b"before-idle");
+
+    // 超过阈值（1s）+ 一轮检查间隔（1s）
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // 同一源端口：会话已回收，应能重新建立
+    assert_eq!(udp_echo_until(&a, b"after-idle").await, b"after-idle");
+}
+
+/// T064：用户模式下 UDP 端口不在授权区间时注册被拒
+#[tokio::test]
+async fn udp_port_authorization() {
+    let echo_port = spawn_udp_echo().await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(srv_listener, user_server_config(srv_port)));
+
+    // alice 的授权区间是 61000-61010
+    let mut cfg = udp_client_config(srv_port, "udp-echo", echo_port, 62000);
+    cfg.token = "alice-token".into();
+    let err = run_once(cfg).await.expect_err("越权 UDP 端口应被拒绝");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("62000"), "拒绝原因未指明端口: {msg}");
+
+    // 区间内可用
+    let mut cfg = udp_client_config(srv_port, "udp-echo", echo_port, 61005);
+    cfg.token = "alice-token".into();
+    tokio::spawn(run_once(cfg));
+    let a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    a.connect(("127.0.0.1", 61005)).await.unwrap();
+    assert_eq!(udp_echo_until(&a, b"authorized").await, b"authorized");
+}
+
+/// T065：UDP 代理经 QUIC 隧道承载时行为一致（承载与 UDP 语义解耦）
+#[tokio::test]
+async fn udp_over_quic_transport() {
+    let echo_port = spawn_udp_echo().await;
+    let (cert_path, key_path, fingerprint) = write_cert("rfp-udp-quic");
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(
+        srv_listener,
+        quic_server_config(
+            srv_port,
+            &cert_path.display().to_string(),
+            &key_path.display().to_string(),
+        ),
+    ));
+
+    let remote_port = safe_port(16800).await;
+    let mut cfg = udp_client_config(srv_port, "udp-echo", echo_port, remote_port);
+    cfg.transport = Transport::Quic;
+    cfg.tls = ClientTls {
+        enabled: true,
+        server_fingerprint: Some(fingerprint),
+    };
+    let endpoint = quic_endpoint(&cfg).unwrap();
+    let ep = endpoint.clone();
+    tokio::spawn(async move { run_quic_once(&ep, cfg).await });
+
+    let a = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    a.connect(("127.0.0.1", remote_port)).await.unwrap();
+    assert_eq!(udp_echo_until(&a, b"over-quic").await, b"over-quic");
 }

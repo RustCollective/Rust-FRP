@@ -41,6 +41,30 @@ pub struct ServerConfig {
     /// 域名证书表（S1）：未列出的 SNI 一律拒绝握手
     #[serde(default)]
     pub certs: Vec<CertEntry>,
+    /// UDP 代理段（S2）
+    #[serde(default)]
+    pub udp: UdpConfig,
+}
+
+/// UDP 代理段（`[udp]`，S2）
+#[derive(Debug, Clone, Deserialize)]
+pub struct UdpConfig {
+    /// 会话空闲回收阈值（秒）。静默超过该值的会话被回收，
+    /// 同源端口随后再发包会重建会话。
+    #[serde(default = "default_udp_idle_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for UdpConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_udp_idle_secs(),
+        }
+    }
+}
+
+fn default_udp_idle_secs() -> u64 {
+    60
 }
 
 /// vhost 监听段（`[http]` / `[https]`）
@@ -235,6 +259,9 @@ impl ServerConfig {
                     "subdomain_host `{sub}` 无效：必须是具体域名，不支持通配"
                 ));
             }
+        }
+        if self.udp.idle_timeout_secs == 0 {
+            return Err("[udp] idle_timeout_secs 必须大于 0（为 0 会让会话无法建立）".into());
         }
         Ok(())
     }

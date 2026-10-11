@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use quinn::crypto::rustls::QuicClientConfig;
 use rfp_common::frame::{control_framed, read_frame, recv_msg, send_msg, write_frame, Control};
-use rfp_common::msg::{version_compatible, HttpInit, Message, VERSION};
+use rfp_common::msg::{version_compatible, HttpInit, Message, ProxyType, VERSION};
 use rfp_common::now_ms;
 use rfp_common::quic::{QuicStream, ALPN};
 use rfp_common::AsyncStream;
@@ -394,6 +394,13 @@ async fn handle_quic_data(mut stream: QuicStream, proxies: Arc<HashMap<String, P
         }
         return;
     }
+    // S2：UDP 会话在隧道内是长度前缀数据报流，不能当裸字节桥接
+    if proxy.proxy_type == ProxyType::Udp {
+        if let Err(e) = crate::forward::forward_udp(proxy, stream).await {
+            warn!(conn_id, proxy = %proxy_name, error = %e, "udp forward failed");
+        }
+        return;
+    }
     let local_addr = proxy.local_addr.clone();
     let mut local = match TcpStream::connect(local_addr.as_str()).await {
         Ok(s) => s,
@@ -460,6 +467,13 @@ async fn handle_new_conn(
     if let Some(meta) = http {
         if let Err(e) = crate::forward::forward_http(conn_id, proxy, &meta, tunnel).await {
             warn!(conn_id, error = %e, "http forward failed");
+        }
+        return;
+    }
+    // S2：UDP 会话在隧道内是长度前缀数据报流
+    if proxy.proxy_type == ProxyType::Udp {
+        if let Err(e) = crate::forward::forward_udp(proxy, tunnel).await {
+            warn!(conn_id, error = %e, "udp forward failed");
         }
         return;
     }

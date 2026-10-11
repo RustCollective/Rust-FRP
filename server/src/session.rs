@@ -207,11 +207,57 @@ async fn register_proxy(
             register_vhost(state, session, name, proxy_type, vhost, vhosts, subdomain).await?;
             Ok(None)
         }
-        ProxyType::Udp => Err(format!(
-            "{} 代理尚未支持（见 specs/001-frp-parity US2）",
-            type_name(ProxyType::Udp)
-        )),
+        ProxyType::Udp => register_udp(state, session, name, remote_port)
+            .await
+            .map(Some),
     }
+}
+
+/// UDP 型代理注册（S2）：端口授权 → 冲突检查 → 绑定 UDP → 起会话分发任务。
+async fn register_udp(
+    state: &Arc<ServerState>,
+    session: &Arc<SessionHandle>,
+    name: &str,
+    remote_port: Option<u16>,
+) -> Result<u16, String> {
+    let Some(port) = remote_port else {
+        return Err("udp 代理需要 remote_port".into());
+    };
+    if port == 0 {
+        return Err("remote_port 不能为 0".into());
+    }
+    authorize_port(&session.identity, port)?;
+
+    let mut registry = state.registry.lock().await;
+    if registry.by_name.contains_key(name) {
+        return Err("同名代理已存在".into());
+    }
+    if registry.by_port.contains_key(&port) {
+        // tcp 与 udp 共用端口表：同端口不同协议也视为冲突，避免语义歧义
+        return Err(format!("端口 {port} 已被占用（tcp/udp 共用端口表）"));
+    }
+    let socket = tokio::net::UdpSocket::bind((state.bind_addr.as_str(), port))
+        .await
+        .map_err(|e| format!("绑定 UDP {port} 失败: {e}"))?;
+    let port = socket.local_addr().map(|a| a.port()).unwrap_or(port);
+    registry.by_name.insert(name.to_string(), Arc::clone(session));
+    registry.by_port.insert(port, Arc::clone(session));
+    drop(registry);
+
+    let task = tokio::spawn(crate::udp::serve(
+        Arc::clone(state),
+        Arc::clone(session),
+        name.to_string(),
+        Arc::new(socket),
+    ));
+    session.registered.lock().unwrap().push(RegisteredProxy {
+        name: name.to_string(),
+        port: Some(port),
+        listener: Some(task),
+        vhosts: vec![],
+    });
+    info!(proxy = %name, port, "udp proxy registered");
+    Ok(port)
 }
 
 /// 域名型代理注册（S1）：监听端口已配置 → 域名授权 → 冲突 → 原子登记。
