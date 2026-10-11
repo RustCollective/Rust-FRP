@@ -331,3 +331,14 @@ US1 完成后即具备 M3（HTTP/3 网关）的起步条件——`vhost::router`
 - [ ] T112 重跑 T053（流式/SC-007）与 T054（延迟/SC-004）的上游真实链路验收
 - [ ] T113 验收通过后清理上游的验收遗留：删除临时 nginx 站点文件并 reload、
       按需移除 `rfps.toml` 中的 `[http]`/`[https]`/`[[certs]]` 与 65532 端口授权
+- [ ] T114 查 SpecKit 是否有"验收记录"类的标准产物位置与流程（当前落在
+      `specs/001-frp-parity/acceptance/` 属自定约定）；确认后决定是否迁移，
+      并同步修正 quickstart.md 第 0 节的路径说明
+- [ ] T115 修 F4 注册期竞态：客户端注册循环必须能容忍并排队处理插进来的
+      `NewConnection`（当前会把非 `RegisterProxyAck` 的应答当成异常并断开整条
+      控制连接）。证据见 acceptance/2026-10-12-real-link.md F4
+- [ ] T116 修 F5 单代理失败传染：一个代理注册失败当前会让整条会话断开重连，
+      其余代理陪跑。应改为按代理粒度报错，不牵连会话
+- [ ] T117 评估 F6 的配置陷阱：把 `subdomain_host` 收进 `[vhost]` 子表（或用
+      `#[serde(deny_unknown_fields)]` 让位置错误直接报错），避免"键被 TOML 段
+      吞掉、报错却指向缺配置"的误导
