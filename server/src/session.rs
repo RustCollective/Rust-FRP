@@ -310,7 +310,7 @@ async fn register_vhost(
     // 3. 逐个归一化 + 授权检查
     let mut keys = Vec::with_capacity(domains.len());
     for d in &domains {
-        let Some(k) = crate::vhost::router::vhost_key(d) else {
+        let Some(k) = crate::vhost::router::vhost_key(d, proxy_type) else {
             return Err(format!("域名 `{d}` 无效"));
         };
         authorize_vhost(&session.identity, d)?;
@@ -323,25 +323,27 @@ async fn register_vhost(
         return Err("同名代理已存在".into());
     }
     for (d, k) in domains.iter().zip(keys.iter()) {
+        // 冲突按 (类型, 域名) 判定：同域名的 http 与 https 是两条独立映射
+        let slot = (proxy_type, k.key.clone());
         let owner = if k.wildcard {
-            registry.by_vhost_wildcard.get(&k.key)
+            registry.by_vhost_wildcard.get(&slot)
         } else {
-            registry.by_vhost_exact.get(&k.key)
+            registry.by_vhost_exact.get(&slot)
         };
         if let Some(e) = owner {
             return Err(format!("域名 `{d}` 已被会话 {} 注册", e.session.id));
         }
     }
     for k in &keys {
-        let entry = VhostEntry {
+        let row = VhostEntry {
             session: Arc::clone(session),
             proxy_name: name.to_string(),
-            kind: proxy_type,
         };
+        let slot = (proxy_type, k.key.clone());
         if k.wildcard {
-            registry.by_vhost_wildcard.insert(k.key.clone(), entry);
+            registry.by_vhost_wildcard.insert(slot, row);
         } else {
-            registry.by_vhost_exact.insert(k.key.clone(), entry);
+            registry.by_vhost_exact.insert(slot, row);
         }
     }
     registry.by_name.insert(name.to_string(), Arc::clone(session));

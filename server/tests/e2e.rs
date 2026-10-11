@@ -1212,3 +1212,175 @@ async fn udp_over_quic_transport() {
     a.connect(("127.0.0.1", remote_port)).await.unwrap();
     assert_eq!(udp_echo_until(&a, b"over-quic").await, b"over-quic");
 }
+
+/// 同一域名同时注册 `http` 与 `https` 两条代理：互不抢占，各自由对应监听服务。
+///
+/// 这是 spec.md 的边界情形，也是 2026-10-12 真实链路验收时暴露出来的实现缺陷
+/// （原实现把同域名的 http/https 判成了冲突）。回归防线就放这里。
+#[tokio::test]
+async fn vhost_same_domain_http_and_https() {
+    let (plain_origin, _s1) = spawn_http_origin("plain-side").await;
+    let (tls_origin, _s2) = spawn_http_origin("tls-side").await;
+
+    let ck = rcgen::generate_simple_self_signed(vec!["app.example.com".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!("rfp-e2e-bothkind-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("app.crt");
+    let key_path = dir.join("app.key");
+    std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+    std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+    let fingerprint = rfp_common::sha256_hex(ck.cert.der());
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18700).await;
+    let https_port = safe_port(18800).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(
+            srv_port,
+            Some(http_port),
+            Some(https_port),
+            vec![CertEntry {
+                domain: "app.example.com".into(),
+                cert: cert_path.display().to_string(),
+                key: key_path.display().to_string(),
+            }],
+        ),
+    ));
+
+    let mk = |name: &str, kind: ProxyType, origin: u16| ProxyConfig {
+        name: name.into(),
+        proxy_type: kind,
+        local_addr: format!("127.0.0.1:{origin}"),
+        remote_port: None,
+        custom_domains: vec!["app.example.com".into()],
+        subdomain: None,
+        local_tls: LocalTlsConfig::default(),
+    };
+    // 同一个会话里注册同名域名的 http 与 https 两条代理
+    tokio::spawn(run_once(ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Tcp,
+        token: "secret".into(),
+        proxies: vec![
+            mk("web-http", ProxyType::Http, plain_origin),
+            mk("web-https", ProxyType::Https, tls_origin),
+        ],
+        tls: plain_client_tls(),
+    }));
+
+    // 明文监听 → plain-side
+    let plain = vhost_get_until_ok(http_port, "app.example.com", "/").await;
+    assert!(plain.contains("plain-side"), "{plain}");
+    assert!(!plain.contains("tls-side"), "明文监听串到了 https 代理: {plain}");
+
+    // TLS 监听 → tls-side（证书必须真校验通过，不用跳过）
+    let tls_cfg = rfp_client::tls::rustls_client_config(Some(&fingerprint)).unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
+    let name = rustls::pki_types::ServerName::try_from("app.example.com").unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let Ok(tcp) = TcpStream::connect(("127.0.0.1", https_port)).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Ok(mut tls) = connector.connect(name.clone(), tcp).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let req = "GET / HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n";
+            if tls.write_all(req.as_bytes()).await.is_err() {
+                continue;
+            }
+            let mut out = Vec::new();
+            let _ = tls.read_to_end(&mut out).await;
+            let resp = String::from_utf8_lossy(&out).to_string();
+            if resp.contains("tls-side") {
+                return resp;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("HTTPS vhost 请求始终未成功");
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// h2c（prior knowledge）访客：Host 来自 `:authority`，必须被补回转发头。
+///
+/// 2026-10-12 真实链路验收发现的缺陷：同一个 TLS 监听，curl 走 h1.1 时 origin
+/// 能收到 Host，协商到 h2 就丢了（h2 没有 Host 头，authority 在伪头里）。
+#[tokio::test]
+async fn vhost_http2_authority_becomes_host() {
+    let (origin_port, seen) = spawn_http_origin("h2-ok").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18900).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+
+    let body = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let Ok(tcp) = TcpStream::connect(("127.0.0.1", http_port)).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            // h2c：明文上的 HTTP/2（prior knowledge）
+            let Ok((mut sender, conn)) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                hyper_util::rt::TokioIo::new(tcp),
+            )
+            .await
+            else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            // h2 的 authority 来自 URI，而不是 Host 头
+            let req = hyper::Request::builder()
+                .method("GET")
+                .uri("http://app.example.com/")
+                .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+                .unwrap();
+            let Ok(resp) = sender.send_request(req).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let status = resp.status();
+            let bytes = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            if status == 200 && text.contains("h2-ok") {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("h2c vhost 请求始终未成功");
+
+    assert!(body.contains("h2-ok"), "{body}");
+    // 关键断言：origin 必须收到 Host
+    let head = seen.lock().unwrap().clone().to_lowercase();
+    assert!(
+        head.contains("host: app.example.com"),
+        "h2 访客的 Host 没有传到 origin:\n{head}"
+    );
+}

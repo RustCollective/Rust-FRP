@@ -177,6 +177,18 @@ async fn bridge(
     let (parts, body) = req.into_parts();
 
     let mut headers = strip_hop_by_hop(&parts.headers);
+    // HTTP/2 不传 Host 头：authority 在 `:authority` 里，hyper 把它映射到
+    // `uri.authority()`。不补回去的话，h2 访客请求到了 origin 就丢了 Host——
+    // origin 只要做基于 Host 的虚拟主机或路由就会踩坑。h2→h1 转换保留
+    // authority 是标准做法（RFC 9113 §8.3.1）。
+    //
+    // 这是 2026-10-12 真实链路验收发现的：同一个 TLS 监听，curl 走 h1.1 时
+    // Host 正常，协商到 h2 就丢了。
+    if !headers.iter().any(|(n, _)| n == "host") {
+        if let Some(authority) = parts.uri.authority() {
+            headers.push(("host".into(), authority.to_string()));
+        }
+    }
     append_forwarded(&mut headers, &peer.ip().to_string(), proto);
     let init = HttpInit {
         method: parts.method.to_string(),

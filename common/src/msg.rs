@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 pub const VERSION: &str = "1.0";
 
 /// 代理类型。M1 实现 TCP；S1 起实现 HTTP/HTTPS（域名路由）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 实现 `Hash` 是给服务端的域名路由表用的：同一域名可以有 `http` 与 `https`
+/// 两条独立代理（监听端口不同、证书不同），路由键因此是 `(类型, 域名)`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyType {
     Tcp,

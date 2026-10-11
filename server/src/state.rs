@@ -74,10 +74,14 @@ pub enum AuthPolicy {
 pub struct Registry {
     pub by_name: HashMap<String, Arc<SessionHandle>>,
     pub by_port: HashMap<u16, Arc<SessionHandle>>,
-    /// 精确域名 → 路由项（S1）
-    pub by_vhost_exact: HashMap<String, VhostEntry>,
-    /// 通配域名 → 路由项（S1）。键为去掉 `*.` 后的后缀，如 `alice.dev`
-    pub by_vhost_wildcard: HashMap<String, VhostEntry>,
+    /// 精确域名 → 路由项（S1）。键为 `(代理类型, 归一化域名)`
+    ///
+    /// 键里带类型是必需的：同一域名可以同时有 `http` 与 `https` 两条代理
+    /// （监听端口不同、证书不同），两者互不抢占
+    /// （spec.md 边界情形：同一域名的 http 与 https 代理分别注册应被允许）。
+    pub by_vhost_exact: HashMap<(ProxyType, String), VhostEntry>,
+    /// 通配域名 → 路由项（S1）。键为 `(代理类型, 去掉 `*.` 后的后缀)`
+    pub by_vhost_wildcard: HashMap<(ProxyType, String), VhostEntry>,
 }
 
 /// 域名路由项：命中后足以定位代理并驱动一条隧道
@@ -86,8 +90,6 @@ pub struct VhostEntry {
     pub session: Arc<SessionHandle>,
     /// 反查代理（NewConnection / ConnInit 需要）
     pub proxy_name: String,
-    /// 注册时的代理类型：`Http` 只服务明文监听，`Https` 只服务 TLS 监听
-    pub kind: ProxyType,
 }
 
 /// 域名注册写入路由表时用的键，供会话结束时精确清理
@@ -97,6 +99,8 @@ pub struct VhostKey {
     pub key: String,
     /// 是否为通配注册（`*.domain`）
     pub wildcard: bool,
+    /// 注册时的代理类型：`Http` 只服务明文监听，`Https` 只服务 TLS 监听
+    pub kind: ProxyType,
 }
 
 /// 域名归一化：ASCII 小写、剥离端口、剥离末尾点。
@@ -293,12 +297,13 @@ pub async fn cleanup_session(state: &ServerState, session: &SessionHandle) {
         }
         for vk in &p.vhosts {
             let mine_entry = |e: &VhostEntry| e.session.id == session.id;
+            let k = (vk.kind, vk.key.clone());
             if vk.wildcard {
-                if registry.by_vhost_wildcard.get(&vk.key).is_some_and(mine_entry) {
-                    registry.by_vhost_wildcard.remove(&vk.key);
+                if registry.by_vhost_wildcard.get(&k).is_some_and(mine_entry) {
+                    registry.by_vhost_wildcard.remove(&k);
                 }
-            } else if registry.by_vhost_exact.get(&vk.key).is_some_and(mine_entry) {
-                registry.by_vhost_exact.remove(&vk.key);
+            } else if registry.by_vhost_exact.get(&k).is_some_and(mine_entry) {
+                registry.by_vhost_exact.remove(&k);
             }
         }
         if let Some(task) = p.listener {

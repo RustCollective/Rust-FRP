@@ -15,8 +15,9 @@ use crate::state::{normalize_host, Registry, SessionHandle, VhostEntry, VhostKey
 /// 由注册声明生成路由表键。
 ///
 /// `*.example.com` → 通配键 `example.com`；其余为精确键。
+/// 键里带上代理类型：同一域名可以同时有 `http` 与 `https` 两条代理。
 /// 归一化后为空（或 `*.` 后为空）返回 `None`，由调用方报错。
-pub fn vhost_key(domain: &str) -> Option<VhostKey> {
+pub fn vhost_key(domain: &str, kind: ProxyType) -> Option<VhostKey> {
     let d = normalize_host(domain);
     // `"*."` 经归一化（剥末尾点）会退化成 `"*"`，必须与空域名一样拒绝
     if d.is_empty() || d == "*" {
@@ -26,8 +27,13 @@ pub fn vhost_key(domain: &str) -> Option<VhostKey> {
         Some(suffix) => (!suffix.is_empty()).then(|| VhostKey {
             key: suffix.to_string(),
             wildcard: true,
+            kind,
         }),
-        None => Some(VhostKey { key: d, wildcard: false }),
+        None => Some(VhostKey {
+            key: d,
+            wildcard: false,
+            kind,
+        }),
     }
 }
 
@@ -58,20 +64,20 @@ fn hit(e: &VhostEntry) -> RouteHit {
 /// 按请求的 host 查路由。
 ///
 /// `kind` 是当前监听端口的类型：`Http` 对应明文监听、`Https` 对应 TLS 监听。
-/// 域名命中但类型不符时返回 `None`（契约 §5：不回落其他代理）。
+/// 类型不一致的代理查不到（键不同），因此不会回落——这正是
+/// "同域名的 http 与 https 代理互不抢占" 的实现基础。
 pub fn lookup(registry: &Registry, host: &str, kind: ProxyType) -> Option<RouteHit> {
     let host = normalize_host(host);
     if host.is_empty() {
         return None;
     }
-    if let Some(e) = registry.by_vhost_exact.get(&host) {
-        // 同名域名已存在但不是本端口的类型：不回落，直接未命中
-        return (e.kind == kind).then(|| hit(e));
+    if let Some(e) = registry.by_vhost_exact.get(&(kind, host.clone())) {
+        return Some(hit(e));
     }
     // 通配：后缀必然等于「第一个点之后的部分」，因此只需一次查表
     let (_, suffix) = host.split_once('.')?;
-    let e = registry.by_vhost_wildcard.get(suffix)?;
-    (e.kind == kind && wildcard_match(&host, suffix)).then(|| hit(e))
+    let e = registry.by_vhost_wildcard.get(&(kind, suffix.to_string()))?;
+    wildcard_match(&host, suffix).then(|| hit(e))
 }
 
 #[cfg(test)]
@@ -92,33 +98,24 @@ mod tests {
         })
     }
 
+    fn entry(sid: &str, name: &str) -> VhostEntry {
+        VhostEntry {
+            session: session(sid),
+            proxy_name: name.into(),
+        }
+    }
+
     /// 建一张包含精确与通配的路由表
     fn registry() -> Registry {
         let mut r = Registry::default();
+        r.by_vhost_exact
+            .insert((ProxyType::Http, "app.example.com".into()), entry("s1", "web"));
         r.by_vhost_exact.insert(
-            "app.example.com".into(),
-            VhostEntry {
-                session: session("s1"),
-                proxy_name: "web".into(),
-                kind: ProxyType::Http,
-            },
+            (ProxyType::Https, "tls.example.com".into()),
+            entry("s1", "web-tls"),
         );
-        r.by_vhost_exact.insert(
-            "tls.example.com".into(),
-            VhostEntry {
-                session: session("s1"),
-                proxy_name: "web-tls".into(),
-                kind: ProxyType::Https,
-            },
-        );
-        r.by_vhost_wildcard.insert(
-            "alice.dev".into(),
-            VhostEntry {
-                session: session("s2"),
-                proxy_name: "wild".into(),
-                kind: ProxyType::Http,
-            },
-        );
+        r.by_vhost_wildcard
+            .insert((ProxyType::Http, "alice.dev".into()), entry("s2", "wild"));
         r
     }
 
@@ -146,6 +143,25 @@ mod tests {
         assert!(lookup(&r, "tls.example.com", ProxyType::Https).is_some());
     }
 
+    /// 同一域名可以同时有 http 与 https 两条代理，互不抢占
+    /// （spec.md 边界情形）
+    #[test]
+    fn same_domain_serves_both_kinds() {
+        let mut r = registry();
+        r.by_vhost_exact.insert(
+            (ProxyType::Https, "app.example.com".into()),
+            entry("s9", "web-tls"),
+        );
+        assert_eq!(
+            lookup(&r, "app.example.com", ProxyType::Http).unwrap().proxy_name,
+            "web"
+        );
+        assert_eq!(
+            lookup(&r, "app.example.com", ProxyType::Https).unwrap().proxy_name,
+            "web-tls"
+        );
+    }
+
     #[test]
     fn wildcard_matches_exactly_one_label() {
         let r = registry();
@@ -163,14 +179,8 @@ mod tests {
     fn exact_wins_over_wildcard() {
         let mut r = registry();
         // 给一个与通配可匹配的同名精确域名
-        r.by_vhost_exact.insert(
-            "x.alice.dev".into(),
-            VhostEntry {
-                session: session("s3"),
-                proxy_name: "exact".into(),
-                kind: ProxyType::Http,
-            },
-        );
+        r.by_vhost_exact
+            .insert((ProxyType::Http, "x.alice.dev".into()), entry("s3", "exact"));
         assert_eq!(lookup(&r, "x.alice.dev", ProxyType::Http).unwrap().proxy_name, "exact");
         // 其他子域仍走通配
         assert_eq!(lookup(&r, "y.alice.dev", ProxyType::Http).unwrap().proxy_name, "wild");
@@ -187,16 +197,16 @@ mod tests {
 
     #[test]
     fn vhost_key_shapes() {
-        let k = vhost_key("*.alice.dev").unwrap();
+        let k = vhost_key("*.alice.dev", ProxyType::Http).unwrap();
         assert!(k.wildcard);
         assert_eq!(k.key, "alice.dev");
 
-        let k = vhost_key("App.Example.COM.").unwrap();
+        let k = vhost_key("App.Example.COM.", ProxyType::Https).unwrap();
         assert!(!k.wildcard);
         assert_eq!(k.key, "app.example.com");
 
-        assert!(vhost_key("").is_none());
-        assert!(vhost_key("*.").is_none());
+        assert!(vhost_key("", ProxyType::Http).is_none());
+        assert!(vhost_key("*.", ProxyType::Http).is_none());
     }
 
     #[test]
