@@ -1,50 +1,106 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+# Rust-FRP Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. 提交纪律：收尾即提交（NON-NEGOTIABLE）
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+每一轮任务收尾时，只要涉及追踪文件的新增或修改，就 MUST 执行 `git commit`，并 MUST 推送到
+`origin/main`——提交不留在本地积压。本原则无例外，不需要征求确认。
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+- **拆分为独立提交**：`docs` / `feat` / `fix` / `refactor` / `test` / `chore` 分开，
+  一笔提交只做一件事。
+- **提交信息格式**：`<type>: <摘要>`，空行后写详情（动机、关键决策、被否决的方案），
+  中文书写。
+- **验收即提交**：测试绿或冒烟通过即视为验收通过，MUST NOT 在验收通过后再询问"是否提交"，
+  除非用户另有指示。
+- **网络不可达时**：先尝试本机代理（`127.0.0.1:10809`）再判定推送失败，不得直接放弃推送。
+- **理由**：本项目以提交为唯一的工作留痕。未提交的改动对下一轮不可见，等于没做；
+  提交粒度决定事后能否按功能回溯与回滚。
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### II. 验证拓扑：本机客户端、上游服务端（NON-NEGOTIABLE）
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+端到端验证 MUST 采用真实跨公网拓扑，而不是本机 loopback 自环：
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+- **本机 = 客户端侧**：运行 `rfpc`（systemd `rfpc.service`）+ 内网 origin 服务。
+- **上游 = 服务端侧**：公网 VPS 运行 `rfps`（systemd `rfps.service`），承载端口监听与隧道接入。
+- 验收 MUST 使用 release 二进制 + 真实 origin 服务。
+- 本机自环的 e2e 测试仅作快速回归，MUST NOT 作为验收依据。
+- **理由**：QUIC 流语义、半关闭映射、超时与重连、证书与 fingerprint 校验、云安全组放行，
+  这些失效面只在跨公网、经 NAT、带真实 RTT 的链路上暴露。本项目 M2 的多个缺陷正是属于
+  这一类——本地全绿而公网行为不同。
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+### III. 默认加密，不提供明文模式
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+- 传输层 MUST 默认加密（TLS 1.3）；明文 MUST 通过显式配置声明，不存在"忘配置即明文"的路径。
+- 服务端未配置证书时 MUST 自动生成自签证书并落盘复用，并在启动日志打印证书 SHA256
+  fingerprint，供客户端固定。
+- 客户端 MUST 支持指纹固定（自签场景）与系统根验证（真证书场景）。
+- QUIC 承载下无明文选项——这是协议固有约束，不得为调试便利开例外。
+- **理由**：穿透工具的流量穿越不可控网络，明文暴露等于把内网服务的凭据与内容交给路径设备。
+  加密必须是不作为的默认值，而不是需要记得打开的开关。
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+### IV. 传输无关的帧协议
+
+- 帧格式 MUST NOT 绑定具体承载。更换或并存承载方式（TCP / QUIC）时，消息语义不变。
+- 控制消息以 JSON 编码、以 `type` 字段判别；未知字段 MUST 被忽略（向后兼容），
+  未知 `type` MUST 回错误但不断开连接。
+- 版本策略：`hello` 交换主次号，主号不同即拒绝；次号不同取双方交集行为。
+  加字段不改语义属次号演进，删字段或改语义 MUST 升主号。
+- 每条用户连接 MUST 对应一条独立的流通道；MUST NOT 引入连接池或多路复用层来"优化"它。
+- **理由**：调试优先与传输无关共同换来了 M1→M2 的平滑迁移——换承载层时协议零改动。
+  一旦帧格式与承载耦合，后续每一次传输演进都会变成协议变更。
+
+### V. 既有设计决策不可静默回退
+
+`docs/CONVENTIONS.md` 的「设计决策记录（勿回退）」与 `docs/protocol.md` 的既定语义是强制约束。
+改动它们 MUST 走宪法修订流程，MUST NOT 以"顺手简化"的方式在实现中推翻。
+
+- `conn_id` 由服务端全局自增分配。
+- ping/pong 仅做延迟统计；连接活性交给传输层，不叠加应用层心跳。
+- QUIC 拒绝路径 MUST 显式关闭并等待对端读完——流被 drop 即 reset，会丢掉尚未发出的错误帧。
+- 0-RTT 仅在同进程内重连生效（会话票据不落盘）；被拒 MUST 自动降级为 1-RTT，不重试死循环。
+- HTTP/3 采用边缘终止（服务端终止 H3 并按域名路由），不做端到端 QUIC 透传。
+- 结构性不复刻清单（连接池/多路复用层、传输层加密开关、应用层心跳、端到端 H3）
+  见规格 `specs/001-frp-parity/spec.md` 附录 A.4；清单内机制 MUST NOT 被反复当作缺陷提出。
+- **理由**：这些决策各自都吃过一次亏（流语义误判、票据生命周期误判、架构方向误判）。
+  没有书面证据就推翻它们，等于把代价重付一遍。提出替代方案时必须先证伪原决策的理由。
+
+## 附加约束（技术栈与代码约定）
+
+- **工程结构**：单 Cargo workspace，三个 crate——`common`（协议）、`client`（`rfpc`）、
+  `server`（`rfps`）。新增依赖 MUST 走 `workspace.dependencies` 统一管理。
+- **配置**：TOML，结构与 frp v0.52+ 风格对齐（`[[proxies]]` / `[[users]]`），默认端口 7000。
+- **日志**：tracing。info 记会话、注册、连接生命周期；debug 记帧级细节。
+- **错误**：库代码用 thiserror，应用层用 anyhow；客户端会话错误 MUST 区分
+  Fatal（不重试）与 Retry（退避重连）。
+- **语言**：注释与文档使用中文。
+- **测试**：协议层 MUST 有单元测试覆盖消息 roundtrip 与边界帧；端到端 MUST 覆盖真实链路
+  与认证失败路径；冒烟 MUST 用 release 二进制。
+- **功能对等基线**：与 frp 的差集、优先级与「明确不复刻」清单见
+  `specs/001-frp-parity/spec.md`。该规格是差集项的唯一权威列表，新增能力 MUST 先在此登记。
+
+## 开发工作流与验证环境
+
+- **主线**：单分支 `main`，提交后立即推送，不留本地积压。
+- **环境事实**：部署拓扑、主机、端口、安全组放行状态以 `docs/CONVENTIONS.md` 的
+  「公网部署状态」为唯一权威来源；任何部署变更 MUST 在同一轮内更新该节。
+- **已知阻塞**：上游 UDP 端口未放行导致公网 QUIC 验证未完成（详见
+  `specs/001-frp-parity/spec.md` 附录 A.5）。该阻塞解除前，生产默认走 TCP 传输。
+- **规格流程**：新增能力 MUST 先经 `/speckit.specify` 立项、`/speckit.plan` 出方案、
+  `/speckit.tasks` 拆任务，再进入实现；规格与实现冲突时以规格为准并回改规格。
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+- **效力**：本宪法优先于其他一切实践与既有习惯。与 `docs/CONVENTIONS.md` 冲突时以本文件为准；
+  本文件不重复记录代码约定与部署事实的细节，只做约束。
+- **修订流程**：提出变更 → 记录动机与被否决的替代方案 → 更新本文件 → 递增版本 →
+  以 `docs:` 类型提交并推送。涉及协议语义的修订 MUST 同轮更新 `docs/protocol.md`
+  与 `CHANGELOG.md`。
+- **版本策略**：语义化版本。MAJOR——移除或重定义原则（向后不兼容）；MINOR——新增原则或
+  实质性扩展约束；PATCH——澄清、措辞与非语义修正。
+- **合规审查**：`/speckit.plan` 与 `/speckit.tasks` 的产出 MUST 逐条对照本文件核对。
+  违反 MUST 条款的实现是最高级别缺陷，必须修复或走修订流程，不得以"后续补"结案。
+- **冲突处置**：原则之间冲突时，I 与 II（交付与验证纪律）优先；本文件与其他文档冲突时，
+  回改其他文档。
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 1.0.0 | **Ratified**: 2026-10-11 | **Last Amended**: 2026-10-11
