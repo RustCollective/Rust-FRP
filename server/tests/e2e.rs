@@ -963,3 +963,62 @@ async fn vhost_domain_authorization() {
     let resp = vhost_get_until_ok(http_port, "app.alice.dev", "/").await;
     assert!(resp.contains("alice-page"), "{resp}");
 }
+
+/// T042：QUIC 路径的 vhost 转发——元数据随数据流首帧（`conn_init`）下发。
+///
+/// 与 TCP 用例的区别在于承载：TCP 走控制通道的 `new_connection`，QUIC 走
+/// server 主动 `open_bi` 后的首帧。若首帧没有携带 HTTP 元数据，客户端会退化成
+/// 裸字节桥接（把帧字节当请求发给本地服务），本用例就会因等不到
+/// `http_response_meta` 而失败——因此这条用例确实在区分两条承载路径。
+#[tokio::test]
+async fn vhost_quic_http_routing() {
+    let (origin_port, seen) = spawn_http_origin("hello-over-quic").await;
+    let (cert_path, key_path, fingerprint) = write_cert("rfp-vhost-quic");
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18600).await;
+
+    // QUIC 传输 + vhost 明文监听
+    let mut cfg = quic_server_config(
+        srv_port,
+        &cert_path.display().to_string(),
+        &key_path.display().to_string(),
+    );
+    cfg.http = Some(VhostListener { bind_port: http_port, bind_addr: None });
+    tokio::spawn(serve(srv_listener, cfg));
+
+    let client_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Quic,
+        token: "secret".into(),
+        proxies: vec![ProxyConfig {
+            name: "web".into(),
+            proxy_type: ProxyType::Http,
+            local_addr: format!("127.0.0.1:{origin_port}"),
+            remote_port: None,
+            custom_domains: vec!["app.example.com".into()],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        }],
+        tls: ClientTls {
+            enabled: true,
+            server_fingerprint: Some(fingerprint),
+        },
+    };
+    let endpoint = quic_endpoint(&client_cfg).unwrap();
+    let ep = endpoint.clone();
+    tokio::spawn(async move { run_quic_once(&ep, client_cfg).await });
+
+    let resp = vhost_get_until_ok(http_port, "app.example.com", "/").await;
+    assert!(resp.contains("hello-over-quic"), "{resp}");
+
+    // 转发头与 TCP 路径一致
+    let head = seen.lock().unwrap().clone().to_lowercase();
+    assert!(head.contains("x-forwarded-for"), "origin 未收到 XFF:\n{head}");
+    assert!(
+        head.contains("x-forwarded-proto: http"),
+        "origin 未收到 XFP:\n{head}"
+    );
+}
