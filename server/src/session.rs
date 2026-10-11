@@ -110,7 +110,8 @@ pub async fn handle_control<S: AsyncStream>(
                         break;
                     }
                     Ok(None) => break,
-                    Ok(Some(Message::RegisterProxy { name, proxy_type, local_addr, remote_port, vhost })) => {
+                    // vhosts / subdomain 由 S1（US1）的注册路径消费，此处暂不解构
+                    Ok(Some(Message::RegisterProxy { name, proxy_type, local_addr, remote_port, vhost, .. })) => {
                         let result = register_proxy(
                             &state,
                             &handle,
@@ -212,8 +213,10 @@ async fn register_proxy(
     ));
     session.registered.lock().unwrap().push(RegisteredProxy {
         name: name.to_string(),
-        port,
+        port: Some(port),
         listener: task,
+        // TCP 代理不注册域名；域名路由见 S1（US1）
+        vhosts: vec![],
     });
     Ok(port)
 }
@@ -261,6 +264,8 @@ async fn relay(
                 .send(Message::NewConnection {
                     conn_id,
                     proxy_name: proxy_name.clone(),
+                    // HTTP 类型代理的请求元数据由 S1（T041）在此填充
+                    http: None,
                 })
                 .is_err()
             {
@@ -289,6 +294,8 @@ async fn relay(
             let init = Message::ConnInit {
                 conn_id,
                 proxy_name: proxy_name.clone(),
+                // HTTP 类型代理的请求元数据由 S1（T042）在此填充
+                http: None,
             };
             if let Err(e) = write_frame(&mut stream, &init.encode()).await {
                 debug!(conn_id, error = %e, "quic conn_init write failed");

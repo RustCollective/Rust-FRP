@@ -6,6 +6,7 @@
 //!   endpoint 跨重连复用 → 会话恢复 + 0-RTT
 
 pub mod config;
+pub mod forward;
 pub mod tls;
 
 use std::collections::HashMap;
@@ -145,8 +146,11 @@ async fn handshake<S: AsyncStream>(
                 name: p.name.clone(),
                 proxy_type: p.proxy_type,
                 local_addr: p.local_addr.clone(),
-                remote_port: Some(p.remote_port),
+                remote_port: p.remote_port,
+                // 域名统一走 vhosts（契约允许 vhost / vhosts 取并集）
                 vhost: None,
+                vhosts: p.custom_domains.clone(),
+                subdomain: p.subdomain.clone(),
             },
         )
         .await
@@ -157,7 +161,7 @@ async fn handshake<S: AsyncStream>(
             .map_err(retry)?;
         match resp {
             Some(Message::RegisterProxyAck { name, ok: true, .. }) => {
-                info!(proxy = %name, remote_port = p.remote_port, local_addr = p.local_addr, "proxy registered");
+                info!(proxy = %name, remote_port = ?p.remote_port, domains = ?p.custom_domains, subdomain = ?p.subdomain, local_addr = p.local_addr, "proxy registered");
             }
             Some(Message::RegisterProxyAck { name, ok: false, error }) => {
                 // 按可重试处理：断开重连（可能是上一会话尚未清理的瞬时冲突）
@@ -239,8 +243,8 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
             msg = recv_msg(&mut framed) => {
                 match msg.map_err(retry)? {
                     None => return Err(retry(anyhow!("control connection closed"))),
-                    Some(Message::NewConnection { conn_id, proxy_name }) => {
-                        debug!(conn_id, proxy = %proxy_name, "new connection");
+                    Some(Message::NewConnection { conn_id, proxy_name, http }) => {
+                        debug!(conn_id, proxy = %proxy_name, http = http.is_some(), "new connection");
                         tokio::spawn(handle_new_conn(
                             cfg.server_addr.clone(),
                             cfg.server_port,
@@ -368,7 +372,12 @@ async fn handle_quic_data(mut stream: QuicStream, proxies: Arc<HashMap<String, S
             return;
         }
     };
-    let Ok(Message::ConnInit { conn_id, proxy_name }) = Message::parse(&first) else {
+    let Ok(Message::ConnInit {
+        conn_id,
+        proxy_name,
+        http: _,
+    }) = Message::parse(&first)
+    else {
         warn!("quic data stream: unexpected first frame");
         return;
     };
@@ -431,7 +440,8 @@ async fn handle_new_conn(
         },
         None => Box::new(tcp),
     };
-    let init = Message::ConnInit { conn_id, proxy_name };
+    // M1 数据连接：请求元数据已随控制通道的 new_connection 下发，此处不再携带
+    let init = Message::ConnInit { conn_id, proxy_name, http: None };
     if let Err(e) = write_frame(&mut tunnel, &init.encode()).await {
         warn!(conn_id, error = %e, "send conn_init failed");
         return;

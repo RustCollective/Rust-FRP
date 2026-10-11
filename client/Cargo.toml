@@ -23,3 +23,7 @@ rustls-pki-types.workspace = true
 rustls-pemfile.workspace = true
 rustls-webpki.workspace = true
 quinn.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true

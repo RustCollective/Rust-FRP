@@ -5,6 +5,7 @@ mod quic;
 mod session;
 mod state;
 pub mod tls;
+pub mod vhost;
 
 use std::sync::Arc;
 use std::time::Duration;

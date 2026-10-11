@@ -29,6 +29,47 @@ pub struct ServerConfig {
     /// QUIC 传输（M2；默认关闭，显式开启）
     #[serde(default)]
     pub quic: QuicConfig,
+    /// vhost 明文 HTTP 监听（S1；缺省不启用）
+    #[serde(default)]
+    pub http: Option<VhostListener>,
+    /// vhost TLS 监听（S1；缺省不启用）
+    #[serde(default)]
+    pub https: Option<VhostListener>,
+    /// 子域名后缀（S1）：配置后客户端只声明 `subdomain` 标签即可注册
+    #[serde(default)]
+    pub subdomain_host: Option<String>,
+    /// 域名证书表（S1）：未列出的 SNI 一律拒绝握手
+    #[serde(default)]
+    pub certs: Vec<CertEntry>,
+}
+
+/// vhost 监听段（`[http]` / `[https]`）
+#[derive(Debug, Clone, Deserialize)]
+pub struct VhostListener {
+    pub bind_port: u16,
+    /// 缺省复用全局 `bind_addr`
+    #[serde(default)]
+    pub bind_addr: Option<String>,
+}
+
+impl VhostListener {
+    /// 实际监听地址
+    pub fn addr(&self, default_bind: &str) -> String {
+        self.bind_addr
+            .clone()
+            .unwrap_or_else(|| default_bind.to_string())
+    }
+}
+
+/// 域名证书项（`[[certs]]`）
+#[derive(Debug, Clone, Deserialize)]
+pub struct CertEntry {
+    /// 域名，支持 `*.example.com` 通配；匹配语义由 rustls 决定
+    pub domain: String,
+    /// 证书链 PEM 路径
+    pub cert: String,
+    /// 私钥 PEM 路径
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +193,57 @@ fn parse_port_range(spec: &str) -> Result<(u16, u16), String> {
     }
 }
 
+impl ServerConfig {
+    /// 启动期结构校验（S1）。
+    ///
+    /// 证书文件的加载与「证书/私钥配对」校验在 `vhost::certs` 中完成（那里才有
+    /// PEM 解析能力），两者共同构成 `contracts/config-vhost.md` §1.3 的启动期校验。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.https.is_some() && self.certs.is_empty() {
+            return Err("[https] 已启用但 [[certs]] 为空：TLS 监听没有可用证书".into());
+        }
+        // 监听端口互斥（同一端口无法同时承载控制面与 vhost 网关）
+        let mut ports = HashSet::new();
+        ports.insert(self.bind_port);
+        if let Some(h) = &self.http {
+            if !ports.insert(h.bind_port) {
+                return Err(format!("[http] bind_port {} 与已有监听端口冲突", h.bind_port));
+            }
+        }
+        if let Some(h) = &self.https {
+            if !ports.insert(h.bind_port) {
+                return Err(format!(
+                    "[https] bind_port {} 与已有监听端口冲突",
+                    h.bind_port
+                ));
+            }
+        }
+        // 证书域名：归一化后非空、不重复，且路径非空
+        let mut domains = HashSet::new();
+        for c in &self.certs {
+            let d = crate::state::normalize_host(&c.domain);
+            if d.is_empty() {
+                return Err("[[certs]] 的 domain 不能为空".into());
+            }
+            if !domains.insert(d.clone()) {
+                return Err(format!("[[certs]] 域名重复: {d}"));
+            }
+            if c.cert.is_empty() || c.key.is_empty() {
+                return Err(format!("[[certs]] `{d}` 的 cert / key 路径不能为空"));
+            }
+        }
+        if let Some(sub) = &self.subdomain_host {
+            let d = crate::state::normalize_host(sub);
+            if d.is_empty() || d.contains('*') {
+                return Err(format!(
+                    "subdomain_host `{sub}` 无效：必须是具体域名，不支持通配"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +302,64 @@ vhosts = ["*.alice.dev"]
         )
         .unwrap();
         assert!(cfg.auth_policy().is_err());
+    }
+
+    /// S1：vhost 段与证书表的启动期校验
+    #[test]
+    fn vhost_startup_validation() {
+        // [https] 启用但证书表为空 → 拒绝
+        let cfg =
+            toml::from_str::<ServerConfig>("bind_port = 7000\n[https]\nbind_port = 8443\n").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("certs"));
+
+        // [http] 明文监听不需要证书
+        let cfg =
+            toml::from_str::<ServerConfig>("bind_port = 7000\n[http]\nbind_port = 8080\n").unwrap();
+        assert!(cfg.validate().is_ok());
+
+        // 端口冲突：[http] 与 bind_port 同端口
+        let cfg =
+            toml::from_str::<ServerConfig>("bind_port = 7000\n[http]\nbind_port = 7000\n").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("冲突"));
+
+        // 端口冲突：[http] 与 [https] 同端口
+        let cfg = toml::from_str::<ServerConfig>(
+            "bind_port = 7000\n[http]\nbind_port = 8080\n[https]\nbind_port = 8080\n\
+             [[certs]]\ndomain = \"a.example.com\"\ncert = \"/tmp/a.crt\"\nkey = \"/tmp/a.key\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().unwrap_err().contains("冲突"));
+
+        // 证书域名重复（大小写归一化后同形）
+        let cfg = toml::from_str::<ServerConfig>(
+            "bind_port = 7000\n[https]\nbind_port = 8443\n\
+             [[certs]]\ndomain = \"A.example.com\"\ncert = \"/tmp/a.crt\"\nkey = \"/tmp/a.key\"\n\
+             [[certs]]\ndomain = \"a.example.com\"\ncert = \"/tmp/b.crt\"\nkey = \"/tmp/b.key\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().unwrap_err().contains("重复"));
+
+        // 证书路径为空
+        let cfg = toml::from_str::<ServerConfig>(
+            "bind_port = 7000\n[https]\nbind_port = 8443\n\
+             [[certs]]\ndomain = \"a.example.com\"\ncert = \"\"\nkey = \"/tmp/a.key\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().unwrap_err().contains("路径"));
+
+        // subdomain_host 不支持通配
+        let cfg =
+            toml::from_str::<ServerConfig>("bind_port = 7000\nsubdomain_host = \"*.example.com\"\n")
+                .unwrap();
+        assert!(cfg.validate().unwrap_err().contains("subdomain_host"));
+
+        // 合法：完整 vhost 配置
+        let cfg = toml::from_str::<ServerConfig>(
+            "bind_port = 7000\nsubdomain_host = \"example.com\"\n[http]\nbind_port = 8080\n\
+             [https]\nbind_port = 8443\n\
+             [[certs]]\ndomain = \"*.example.com\"\ncert = \"/tmp/w.crt\"\nkey = \"/tmp/w.key\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }

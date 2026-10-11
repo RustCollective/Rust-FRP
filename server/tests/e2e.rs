@@ -2,12 +2,12 @@
 
 use std::time::Duration;
 
-use rfp_client::config::{ClientConfig, ProxyConfig, TlsConfig as ClientTls, Transport};
+use rfp_client::config::{
+    ClientConfig, LocalTlsConfig, ProxyConfig, TlsConfig as ClientTls, Transport,
+};
 use rfp_client::{quic_endpoint, run_once, run_quic_once, RunError};
 use rfp_common::msg::ProxyType;
-use rfp_server::config::{
-    QuicConfig, ServerConfig, TlsConfig as ServerTls, UserConfig,
-};
+use rfp_server::config::{QuicConfig, ServerConfig, TlsConfig as ServerTls, UserConfig};
 use rfp_server::serve;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -56,6 +56,11 @@ fn test_server_config(port: u16, token: &str) -> ServerConfig {
             key: None,
         },
         quic: QuicConfig::default(),
+        // S1：vhost 段缺省不启用
+        http: None,
+        https: None,
+        subdomain_host: None,
+        certs: vec![],
     }
 }
 
@@ -79,7 +84,11 @@ async fn tcp_proxy_end_to_end() {
             name: "echo".into(),
             proxy_type: ProxyType::Tcp,
             local_addr: format!("127.0.0.1:{echo_port}"),
-            remote_port,
+            remote_port: Some(remote_port),
+            // S1 新增字段：tcp 类型不允许域名与本地 TLS
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
         }],
         tls: plain_client_tls(),
     }));
@@ -155,6 +164,11 @@ fn user_server_config(port: u16) -> ServerConfig {
             key: None,
         },
         quic: QuicConfig::default(),
+        // S1：vhost 段缺省不启用
+        http: None,
+        https: None,
+        subdomain_host: None,
+        certs: vec![],
     }
 }
 
@@ -186,13 +200,17 @@ async fn user_mode_port_authorization() {
             name: "echo".into(),
             proxy_type: ProxyType::Tcp,
             local_addr: format!("127.0.0.1:{echo_port}"),
-            remote_port,
+            remote_port: Some(remote_port),
+            // S1 新增字段：tcp 类型不允许域名与本地 TLS
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
         }],
         tls: plain_client_tls(),
     };
 
     // 授权范围内：注册成功 + 转发可用
-    let allowed = client(61005).proxies[0].remote_port;
+    let allowed = client(61005).proxies[0].remote_port.unwrap();
     {
         tokio::spawn(run_once(client(allowed)));
         let mut user = tokio::time::timeout(Duration::from_secs(10), async {
@@ -271,6 +289,11 @@ async fn tls_pinned_end_to_end() {
                 key: Some(key_path.display().to_string()),
             },
             quic: QuicConfig::default(),
+            // S1：vhost 段缺省不启用
+            http: None,
+            https: None,
+            subdomain_host: None,
+            certs: vec![],
         },
     ));
 
@@ -284,7 +307,11 @@ async fn tls_pinned_end_to_end() {
             name: "echo".into(),
             proxy_type: ProxyType::Tcp,
             local_addr: format!("127.0.0.1:{echo_port}"),
-            remote_port,
+            remote_port: Some(remote_port),
+            // S1 新增字段：tcp 类型不允许域名与本地 TLS
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
         }],
         tls: ClientTls {
             enabled: true,
@@ -341,6 +368,11 @@ async fn tls_wrong_fingerprint_rejected() {
                 key: Some(key_path.display().to_string()),
             },
             quic: QuicConfig::default(),
+            // S1：vhost 段缺省不启用
+            http: None,
+            https: None,
+            subdomain_host: None,
+            certs: vec![],
         },
     ));
 
@@ -392,6 +424,11 @@ fn quic_server_config(srv_port: u16, cert: &str, key: &str) -> ServerConfig {
             enabled: true,
             bind_port: None,
         },
+        // S1：vhost 段缺省不启用
+        http: None,
+        https: None,
+        subdomain_host: None,
+        certs: vec![],
     }
 }
 
@@ -441,7 +478,11 @@ async fn quic_end_to_end() {
             name: "echo".into(),
             proxy_type: ProxyType::Tcp,
             local_addr: format!("127.0.0.1:{echo_port}"),
-            remote_port,
+            remote_port: Some(remote_port),
+            // S1 新增字段：tcp 类型不允许域名与本地 TLS
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
         }],
         tls: ClientTls {
             enabled: true,
@@ -488,7 +529,11 @@ async fn quic_reconnect_after_drop() {
             name: "echo".into(),
             proxy_type: ProxyType::Tcp,
             local_addr: format!("127.0.0.1:{echo_port}"),
-            remote_port,
+            remote_port: Some(remote_port),
+            // S1 新增字段：tcp 类型不允许域名与本地 TLS
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
         }],
         tls: ClientTls {
             enabled: true,

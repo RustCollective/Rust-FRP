@@ -28,6 +28,11 @@ rustls-pemfile = "2"
 rustls-webpki = "0.103"
 quinn = "0.11"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# vhost HTTP/HTTPS 网关（S1；见 specs/001-frp-parity/research.md D1/D9）
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = "0.1"
 sha2 = "0.10"
 
 [profile.release]

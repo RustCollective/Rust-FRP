@@ -69,11 +69,40 @@ pub enum AuthPolicy {
     Users(Vec<Arc<UserAuth>>),
 }
 
-/// 已注册代理表：名称/端口 → 会话
+/// 已注册代理表：名称 / 端口 / 域名 → 会话
 #[derive(Default)]
 pub struct Registry {
     pub by_name: HashMap<String, Arc<SessionHandle>>,
     pub by_port: HashMap<u16, Arc<SessionHandle>>,
+    /// 精确域名 → 会话（S1）
+    pub by_vhost_exact: HashMap<String, Arc<SessionHandle>>,
+    /// 通配域名 → 会话（S1）。键为去掉 `*.` 后的后缀，如 `alice.dev`
+    pub by_vhost_wildcard: HashMap<String, Arc<SessionHandle>>,
+}
+
+/// 域名注册写入路由表时用的键，供会话结束时精确清理
+#[derive(Debug, Clone)]
+pub struct VhostKey {
+    /// 归一化后的域名；通配注册时是去掉 `*.` 的后缀
+    pub key: String,
+    /// 是否为通配注册（`*.domain`）
+    pub wildcard: bool,
+}
+
+/// 域名归一化：ASCII 小写、剥离端口、剥离末尾点。
+///
+/// **注册侧与查询侧必须共用本实现**——两侧不一致会产生「注册成功但访问 404」
+/// 的隐性缺陷（`specs/001-frp-parity/contracts/rfp1-http-vhost.md` §5 的
+/// Normative 条款）。
+pub fn normalize_host(host: &str) -> String {
+    let host = host.trim();
+    let without_port = if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 字面量形态：`[::1]:8080`
+        rest.split_once(']').map(|(inner, _)| inner).unwrap_or(rest)
+    } else {
+        host.split_once(':').map(|(h, _)| h).unwrap_or(host)
+    };
+    without_port.trim_end_matches('.').to_ascii_lowercase()
 }
 
 pub struct ServerState {
@@ -186,8 +215,11 @@ pub struct SessionHandle {
 
 pub struct RegisteredProxy {
     pub name: String,
-    pub port: u16,
+    /// 服务端暴露端口。http/https 类型不占用端口（S1），故为可选
+    pub port: Option<u16>,
     pub listener: JoinHandle<()>,
+    /// 本代理注册的域名键（S1）；会话结束时据此清理路由表
+    pub vhosts: Vec<VhostKey>,
 }
 
 /// 会话结束：注销代理、停监听。只清理仍归属本会话的表项，避免误删新会话的注册。
@@ -199,11 +231,22 @@ pub async fn cleanup_session(state: &ServerState, session: &SessionHandle) {
         if registry.by_name.get(&p.name).is_some_and(mine) {
             registry.by_name.remove(&p.name);
         }
-        if registry.by_port.get(&p.port).is_some_and(mine) {
-            registry.by_port.remove(&p.port);
+        if let Some(port) = p.port {
+            if registry.by_port.get(&port).is_some_and(mine) {
+                registry.by_port.remove(&port);
+            }
+        }
+        for vk in &p.vhosts {
+            if vk.wildcard {
+                if registry.by_vhost_wildcard.get(&vk.key).is_some_and(mine) {
+                    registry.by_vhost_wildcard.remove(&vk.key);
+                }
+            } else if registry.by_vhost_exact.get(&vk.key).is_some_and(mine) {
+                registry.by_vhost_exact.remove(&vk.key);
+            }
         }
         p.listener.abort();
-        tracing::info!(proxy = %p.name, port = p.port, "proxy unregistered");
+        tracing::info!(proxy = %p.name, port = ?p.port, domains = p.vhosts.len(), "proxy unregistered");
     }
 }
 
@@ -271,5 +314,21 @@ mod tests {
         let s = ServerState::new(AuthPolicy::Users(users), "0.0.0.0".into());
         assert!(matches!(s.authenticate("t"), Some(AuthIdentity::User(_))));
         assert!(s.authenticate("secret").is_none());
+    }
+
+    /// S1：归一化是注册侧与查询侧的共同契约，必须锁定行为
+    #[test]
+    fn normalize_host_rules() {
+        assert_eq!(normalize_host("App.Example.COM"), "app.example.com");
+        assert_eq!(normalize_host("app.example.com:8080"), "app.example.com");
+        assert_eq!(normalize_host("app.example.com."), "app.example.com");
+        assert_eq!(normalize_host("  app.example.com  "), "app.example.com");
+        assert_eq!(normalize_host("APP.example.com:443."), "app.example.com");
+        // IPv6 字面量：端口在 `]` 之后，不能按第一个 `:` 切
+        assert_eq!(normalize_host("[::1]:8080"), "::1");
+        assert_eq!(normalize_host("[2001:db8::1]"), "2001:db8::1");
+        // 空串与纯端口
+        assert_eq!(normalize_host(""), "");
+        assert_eq!(normalize_host("*"), "*");
     }
 }

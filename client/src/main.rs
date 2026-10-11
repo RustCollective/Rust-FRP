@@ -1,6 +1,5 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
-use rfp_common::msg::ProxyType;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -28,19 +27,9 @@ async fn main() -> Result<()> {
     let cfg: ClientConfig =
         toml::from_str(&raw).with_context(|| format!("parse {}", args.config))?;
 
-    // 启动期校验
-    let mut names = std::collections::HashSet::new();
-    for p in &cfg.proxies {
-        if p.proxy_type != ProxyType::Tcp {
-            bail!("proxy `{}`: M1 仅支持 type = \"tcp\"", p.name);
-        }
-        if p.remote_port == 0 {
-            bail!("proxy `{}`: remote_port 不能为 0", p.name);
-        }
-        if !names.insert(p.name.as_str()) {
-            bail!("proxy 名称重复: {}", p.name);
-        }
-    }
+    // 启动期校验（类型 / 入口标识 / 本地 TLS 完整性；见 config.rs 的 validate）
+    cfg.validate()
+        .map_err(|e| anyhow::anyhow!("{} 配置无效: {}", args.config, e))?;
 
     info!(
         server = %format!("{}:{}", cfg.server_addr, cfg.server_port),
