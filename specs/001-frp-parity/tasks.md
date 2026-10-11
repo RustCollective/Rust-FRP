@@ -125,16 +125,16 @@ description: "Task list for 001-frp-parity"
 
 **依赖**: 复用 US1 建立的"元数据进首帧、其余裸字节"承载模式（research.md D2）。
 
-- [ ] T056 [P] [US2] 在 `server/src/udp.rs` 新建模块并实现 UDP 监听与转发表骨架（`HashMap<(SocketAddr, u16/*?*/), UdpSession>`，键为外部源地址+源端口）
-- [ ] T057 [US2] 在 `server/src/udp.rs` 实现会话双向转发：保持数据报边界，**MUST NOT 合并或分片重组**（FR-013）
-- [ ] T058 [US2] 在 `server/src/state.rs` 的 `UdpSession` 增加 `last_active: Instant` 与可配置空闲阈值，实现后台回收任务（FR-014）
-- [ ] T059 [US2] 在 `server/src/udp.rs` 实现超帧数据报处置：单帧超限时丢弃并计数，MUST NOT 静默截断（FR-016）
-- [ ] T060 [US2] 在 `server/src/session.rs` 打开 `ProxyType::Udp` 的注册分支，端口授权复用既有 `authorize_port()`（FR-012）
-- [ ] T061 [US2] 在 `client/src/config.rs` 与 `client/src/lib.rs` 打开 `udp` 类型：本地 UDP 转发与数据报边界保持
-- [ ] T062 [P] [US2] 在 `server/tests/e2e.rs` 新增 e2e：UDP 回声链路、同一源端口复用同一会话、换源端口视为新会话
-- [ ] T063 [P] [US2] 在 `server/tests/e2e.rs` 新增 e2e：空闲回收后同源端口可重建会话
-- [ ] T064 [P] [US2] 在 `server/tests/e2e.rs` 新增 e2e：用户模式下端口不在授权区间时注册被拒（FR-012）
-- [ ] T065 [US2] 在 `server/tests/e2e.rs` 新增 e2e：UDP 代理分别经 TCP 隧道与 QUIC 隧道承载，行为一致（FR-015）
+- [x] T056 [P] [US2] 在 `server/src/udp.rs` 新建模块并实现 UDP 监听与转发表骨架（`HashMap<(SocketAddr, u16/*?*/), UdpSession>`，键为外部源地址+源端口）
+- [x] T057 [US2] 在 `server/src/udp.rs` 实现会话双向转发：保持数据报边界，**MUST NOT 合并或分片重组**（FR-013）
+- [x] T058 [US2] 在 `server/src/state.rs` 的 `UdpSession` 增加 `last_active: Instant` 与可配置空闲阈值，实现后台回收任务（FR-014）
+- [x] T059 [US2] 在 `server/src/udp.rs` 实现超帧数据报处置：单帧超限时丢弃并计数，MUST NOT 静默截断（FR-016）
+- [x] T060 [US2] 在 `server/src/session.rs` 打开 `ProxyType::Udp` 的注册分支，端口授权复用既有 `authorize_port()`（FR-012）
+- [x] T061 [US2] 在 `client/src/config.rs` 与 `client/src/lib.rs` 打开 `udp` 类型：本地 UDP 转发与数据报边界保持
+- [x] T062 [P] [US2] 在 `server/tests/e2e.rs` 新增 e2e：UDP 回声链路、同一源端口复用同一会话、换源端口视为新会话
+- [x] T063 [P] [US2] 在 `server/tests/e2e.rs` 新增 e2e：空闲回收后同源端口可重建会话
+- [x] T064 [P] [US2] 在 `server/tests/e2e.rs` 新增 e2e：用户模式下端口不在授权区间时注册被拒（FR-012）
+- [x] T065 [US2] 在 `server/tests/e2e.rs` 新增 e2e：UDP 代理分别经 TCP 隧道与 QUIC 隧道承载，行为一致（FR-015）
 - [ ] T066 [US2] 在真实链路上验收 UDP：**需先解除上游 UDP 端口放行的遗留阻塞**（`docs/CONVENTIONS.md`「公网部署状态」），并把结果与放行后的端口写入该节；同步更新 `specs/001-frp-parity/spec.md` 附录 A.5
 
 **Checkpoint**: US2 独立可交付。**收尾提交并推送**
