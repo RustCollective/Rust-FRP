@@ -1,37 +1,43 @@
 # Rust-FRP 开发规范
 
+> 规则的权威来源是项目宪法 [`.specify/memory/constitution.md`](../.specify/memory/constitution.md)。
+> 本文件只保留两类内容：
+> ① 宪法显式引用本文件作为**唯一权威来源**的部分（设计决策记录、公网部署状态）；
+> ② 宪法未展开的**环境事实与速查**。
+> 与宪法冲突时以宪法为准。
+
 ## 工作流
 
-1. **每轮任务完成即提交**：一个功能/修复/文档独立成笔，不积压
-2. **按功能拆分提交**：docs、feat、fix 分开，一笔提交只做一件事
-3. **提交后立即推送**：`git push` 到 origin/main，不留在本地
-4. **提交信息格式**：`<type>: <摘要>` + 空行 + 详情（动机/关键决策），中文书写
-   - type：`feat` / `fix` / `docs` / `refactor` / `test` / `chore`
-5. **禁止推送前询问是否提交**：任务验收通过（测试绿/冒烟过）即提交推送，除非用户另有指示
+规则见宪法 **原则 I：提交纪律（收尾即提交，NON-NEGOTIABLE）** 与 **Governance**。速查：
+
+- 每轮收尾，只要涉及追踪文件的新增/修改 → `git commit` 并推送到 `origin/main`，不积压
+- 按功能拆分：`docs` / `feat` / `fix` 分开，一笔提交只做一件事
+- 提交信息：`<type>: <摘要>` + 空行 + 详情（动机/关键决策），中文书写
+  - type：`feat` / `fix` / `docs` / `refactor` / `test` / `chore`
+- 验收通过（测试绿 / 冒烟过）即提交推送，不再询问是否提交
+- 推送失败先试本机代理 `127.0.0.1:10809`，不得直接放弃
 
 ## 代码约定
 
-- workspace 三 crate：`common`（协议）、`client`（rfpc）、`server`（rfps）
-- 二进制命名：`rfps` / `rfpc`
+规则见宪法 **附加约束（技术栈与代码约定）**。本文件只补充宪法未列的环境细节：
+
+- 二进制命名：`rfps`（服务端）/ `rfpc`（客户端）
 - 默认端口：7000（控制+数据共用，对齐 frp 迁移习惯）
-- 配置：TOML，结构与 frp v0.52+ 风格对齐（`[[proxies]]`）
-- 依赖新增走 `workspace.dependencies` 统一管理
-- 日志：tracing，info 记会话/注册/连接生命周期，debug 记帧级细节
-- 错误：库代码 thiserror，应用层 anyhow；client 会话错误分 Fatal（不重试）/ Retry（退避重连）
-- 注释与文档使用中文
 
 ## 测试要求
 
-- 协议层（common）：单元测试覆盖消息 roundtrip、边界帧
-- 端到端（server/tests）：真实 TCP 链路，含认证失败路径
-- 冒烟：release 二进制 + 真实 origin（http.server 等）跑通才算验收
-- 公网验证环境：tryanderror.cn（103.119.1.117，SSH 端口 60304，
-  rfps 部署于 /opt/rust-frp，systemd 托管 `rfps.service`，
-  控制端口 10085、测试代理端口 65533 —— 安全组已放行）
-- 本机 rfpc：systemd 托管 `rfpc.service`（/usr/local/bin/rfpc +
+测试分层与验收标准见宪法 **原则 II：验证拓扑（本机客户端、上游服务端，NON-NEGOTIABLE）**
+与 **附加约束 → 测试**。本文件维护验证环境事实：
+
+- **上游 = 服务端侧**：tryanderror.cn（103.119.1.117，SSH 端口 60304），rfps 部署于
+  /opt/rust-frp，systemd 托管 `rfps.service`，控制端口 10085、测试代理端口 65533
+- **本机 = 客户端侧**：systemd 托管 `rfpc.service`（/usr/local/bin/rfpc +
   /etc/rust-frp/rfpc.toml），承载 jyutyu.cn 生产隧道
 
 ## 设计决策记录（勿回退）
+
+宪法 **原则 V：既有设计决策不可静默回退** 将本清单列为强制约束——改动前必须走宪法修订流程，
+且先证伪原决策的理由。**清单本身以本文件为唯一权威来源**。
 
 - M1 TLS 已默认开启（rustls TLS 1.3）：未配置证书时 server 自动生成自签并落盘复用；client 用 fingerprint pinning（自签）或系统根验证（真证书）；明文必须显式 `enabled = false`。协议层不变，TLS 在帧格式之下
 - M1.5 授权模型：token 即身份（协议零改动）；`[[users]]` 用户模式优先于全局 token（legacy）；通配 vhost 匹配恰好一个左标签；legacy 模式拒绝临时端口区间 32768-60999
@@ -43,6 +49,8 @@
 - ping/pong 仅做延迟统计，连接活性交给传输层
 
 ## 公网部署状态
+
+宪法「开发工作流与验证环境」声明**本节是部署事实的唯一权威来源**，任何部署变更必须同轮更新本节。
 
 - tryanderror.cn（103.119.1.117，SSH 见 ~/.ssh/tryanderror.cn）：rfps M2 版已部署（/opt/rust-frp，
   systemd `rfps.service`），TCP+UDP 10085 双监听，`[quic] enabled = true`，
