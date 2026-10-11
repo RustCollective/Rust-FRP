@@ -53,11 +53,13 @@ pub struct VhostListener {
 }
 
 impl VhostListener {
-    /// 实际监听地址
+    /// 实际监听地址（`host:port`）
     pub fn addr(&self, default_bind: &str) -> String {
-        self.bind_addr
+        let host = self
+            .bind_addr
             .clone()
-            .unwrap_or_else(|| default_bind.to_string())
+            .unwrap_or_else(|| default_bind.to_string());
+        format!("{host}:{}", self.bind_port)
     }
 }
 
@@ -98,7 +100,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct QuicConfig {
     /// 默认 false；QUIC 需要安全组额外放行 UDP
     #[serde(default)]
@@ -107,12 +109,6 @@ pub struct QuicConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_port: Option<u16>,
-}
-
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self { enabled: false, bind_port: None }
-    }
 }
 
 impl ServerConfig {

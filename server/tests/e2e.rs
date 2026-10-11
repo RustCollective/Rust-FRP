@@ -1,5 +1,6 @@
 //! 端到端：echo 服务 → rfps → rfpc → 隧道访问。
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rfp_client::config::{
@@ -7,7 +8,10 @@ use rfp_client::config::{
 };
 use rfp_client::{quic_endpoint, run_once, run_quic_once, RunError};
 use rfp_common::msg::ProxyType;
-use rfp_server::config::{QuicConfig, ServerConfig, TlsConfig as ServerTls, UserConfig};
+
+use rfp_server::config::{
+    CertEntry, QuicConfig, ServerConfig, TlsConfig as ServerTls, UserConfig, VhostListener,
+};
 use rfp_server::serve;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -599,4 +603,363 @@ async fn quic_auth_failure_is_fatal() {
     );
 
     let _ = std::fs::remove_dir_all(cert_path.parent().unwrap());
+}
+
+// ============================================================ S1：vhost 网关
+
+/// 最小 HTTP/1.1 origin：记录收到的请求头，回固定响应体
+async fn spawn_http_origin(body: &'static str) -> (u16, Arc<Mutex<String>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let seen_out = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { break };
+            let seen = Arc::clone(&seen_out);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                *seen.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// 带 vhost 段的服务端配置
+fn vhost_server_config(
+    port: u16,
+    http_port: Option<u16>,
+    https_port: Option<u16>,
+    certs: Vec<CertEntry>,
+) -> ServerConfig {
+    let mut cfg = test_server_config(port, "secret");
+    cfg.http = http_port.map(|p| VhostListener { bind_port: p, bind_addr: None });
+    cfg.https = https_port.map(|p| VhostListener { bind_port: p, bind_addr: None });
+    cfg.certs = certs;
+    cfg
+}
+
+/// 域名型代理的客户端配置
+fn vhost_client_config(
+    srv_port: u16,
+    proxy_type: ProxyType,
+    name: &str,
+    origin_port: u16,
+    domains: Vec<String>,
+) -> ClientConfig {
+    ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Tcp,
+        token: "secret".into(),
+        proxies: vec![ProxyConfig {
+            name: name.into(),
+            proxy_type,
+            local_addr: format!("127.0.0.1:{origin_port}"),
+            remote_port: None,
+            custom_domains: domains,
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        }],
+        tls: plain_client_tls(),
+    }
+}
+
+/// 向 vhost 明文端口发一个 h1 请求，读完整响应
+async fn vhost_request(port: u16, host: &str, path: &str) -> String {
+    let mut s = match TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(s) => s,
+        Err(e) => return format!("<connect-failed: {e}>"),
+    };
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if s.write_all(req.as_bytes()).await.is_err() {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 轮询到命中为止（客户端注册与旧会话清理都有延迟）；失败时把最后一次响应带出来
+async fn vhost_get_until_ok(port: u16, host: &str, path: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut last = String::new();
+    while tokio::time::Instant::now() < deadline {
+        last = vhost_request(port, host, path).await;
+        if last.starts_with("HTTP/1.1 200") {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("vhost 请求始终未命中（host={host} port={port}），最后一次响应: {last:?}");
+}
+
+/// T023 + T027：明文按 Host 路由，且 origin 侧收到转发头
+#[tokio::test]
+async fn vhost_http_host_routing() {
+    let (origin_port, seen) = spawn_http_origin("hello-from-origin").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18080).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+
+    let resp = vhost_get_until_ok(http_port, "app.example.com", "/").await;
+    assert!(resp.contains("hello-from-origin"), "响应体不符: {resp}");
+
+    // 转发头：由服务端追加，且 x-forwarded-proto 反映入口协议
+    let head = seen.lock().unwrap().clone();
+    let lower = head.to_lowercase();
+    assert!(lower.contains("x-forwarded-for"), "origin 未收到 XFF:\n{head}");
+    assert!(
+        lower.contains("x-forwarded-proto: http"),
+        "origin 未收到 XFP:\n{head}"
+    );
+    // 逐跳头必须被剥离（请求里带的是 Connection: close）
+    assert!(!lower.contains("connection: close"), "逐跳头未被剥离:\n{head}");
+}
+
+/// T025：未注册域名返回 404，且不回落其他代理
+#[tokio::test]
+async fn vhost_unknown_domain_returns_404() {
+    let (origin_port, _seen) = spawn_http_origin("should-not-be-reached").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18200).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+
+    // 先确认网关已可用，保证 404 不是"还没起来"
+    let ok = vhost_get_until_ok(http_port, "app.example.com", "/").await;
+    assert!(ok.starts_with("HTTP/1.1 200"));
+
+    let resp = vhost_request(http_port, "nope.example.com", "/").await;
+    assert!(resp.starts_with("HTTP/1.1 404"), "未注册域名应 404: {resp}");
+    assert!(
+        !resp.contains("should-not-be-reached"),
+        "404 不应回落其他代理: {resp}"
+    );
+}
+
+/// T026：域名冲突被拒，且先注册者不受影响
+#[tokio::test]
+async fn vhost_domain_conflict_rejected() {
+    let (origin_port, _seen) = spawn_http_origin("first-wins").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18300).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+
+    // 先注册者
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+    vhost_get_until_ok(http_port, "app.example.com", "/").await;
+
+    // 后注册者：同域名不同代理名，必须被拒且原因里带冲突域名
+    let err = run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web2",
+        origin_port,
+        vec!["app.example.com".into()],
+    ))
+    .await
+    .expect_err("同域名注册应被拒绝");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("app.example.com"),
+        "拒绝原因未指明冲突域名: {msg}"
+    );
+
+    // 先注册者仍然可用
+    let resp = vhost_get_until_ok(http_port, "app.example.com", "/").await;
+    assert!(resp.contains("first-wins"), "{resp}");
+}
+
+/// T028：服务端未配置 [http] 监听时注册必须失败（而非"注册成功但访问不通"）
+#[tokio::test]
+async fn vhost_register_rejected_without_listener() {
+    let (origin_port, _seen) = spawn_http_origin("nope").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    // 刻意不配置 [http]
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, None, None, vec![]),
+    ));
+
+    let err = run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    ))
+    .await
+    .expect_err("未配置 [http] 时注册应被拒绝");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("[http] bind_port"),
+        "拒绝原因未指明缺少的监听段: {msg}"
+    );
+}
+
+/// T024：HTTPS 按 SNI 终止——必须在证书校验真的通过的前提下成功
+#[tokio::test]
+async fn vhost_https_sni_termination() {
+    let (origin_port, _seen) = spawn_http_origin("hello-vhost-tls").await;
+
+    // 域名证书
+    let ck = rcgen::generate_simple_self_signed(vec!["app.example.com".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!("rfp-e2e-vhost-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("app.crt");
+    let key_path = dir.join("app.key");
+    std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+    std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+    let fingerprint = rfp_common::sha256_hex(ck.cert.der());
+
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let https_port = safe_port(18443).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(
+            srv_port,
+            None,
+            Some(https_port),
+            vec![CertEntry {
+                domain: "app.example.com".into(),
+                cert: cert_path.display().to_string(),
+                key: key_path.display().to_string(),
+            }],
+        ),
+    ));
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Https,
+        "web-tls",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+
+    // 指纹固定：指纹必须真的匹配，"跳过校验"不能算通过
+    let tls_cfg = rfp_client::tls::rustls_client_config(Some(&fingerprint)).unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
+    let name = rustls::pki_types::ServerName::try_from("app.example.com").unwrap();
+
+    let body = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let Ok(tcp) = TcpStream::connect(("127.0.0.1", https_port)).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let Ok(mut tls) = connector.connect(name.clone(), tcp).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let req = "GET / HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n";
+            if tls.write_all(req.as_bytes()).await.is_err() {
+                continue;
+            }
+            let mut out = Vec::new();
+            let _ = tls.read_to_end(&mut out).await;
+            let resp = String::from_utf8_lossy(&out).to_string();
+            if resp.contains("hello-vhost-tls") {
+                return resp;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("HTTPS vhost 请求始终未成功");
+
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+
+    // SNI 未命中证书表 → 握手必须失败（不回落默认证书）
+    let other = rustls::pki_types::ServerName::try_from("nope.example.com").unwrap();
+    let tcp = TcpStream::connect(("127.0.0.1", https_port)).await.unwrap();
+    let handshake = connector.connect(other, tcp).await;
+    assert!(handshake.is_err(), "未命中 SNI 的握手必须失败");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// T029：用户模式下域名不在 `vhosts` 授权范围时注册被拒（FR-009 从"形同占位"变为真正生效）
+#[tokio::test]
+async fn vhost_domain_authorization() {
+    let (origin_port, _seen) = spawn_http_origin("alice-page").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(18500).await;
+    // 用户模式：alice 的 vhosts = ["*.alice.dev"]
+    let mut cfg = user_server_config(srv_port);
+    cfg.http = Some(VhostListener { bind_port: http_port, bind_addr: None });
+    tokio::spawn(serve(srv_listener, cfg));
+
+    let client_for = |domain: &str| {
+        let mut c = vhost_client_config(
+            srv_port,
+            ProxyType::Http,
+            "web",
+            origin_port,
+            vec![domain.to_string()],
+        );
+        c.token = "alice-token".into();
+        c
+    };
+
+    // 越权域名：必须被拒，且原因里带域名
+    let err = run_once(client_for("evil.example.com"))
+        .await
+        .expect_err("越权域名应被拒绝");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("evil.example.com"), "拒绝原因未指明域名: {msg}");
+
+    // 授权范围内的域名：注册成功且可访问
+    tokio::spawn(run_once(client_for("app.alice.dev")));
+    let resp = vhost_get_until_ok(http_port, "app.alice.dev", "/").await;
+    assert!(resp.contains("alice-page"), "{resp}");
 }

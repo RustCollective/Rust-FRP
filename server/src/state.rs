@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rfp_common::msg::Message;
+use rfp_common::msg::{Message, ProxyType};
 pub use rfp_common::{AsyncStream, BoxedStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -74,10 +74,20 @@ pub enum AuthPolicy {
 pub struct Registry {
     pub by_name: HashMap<String, Arc<SessionHandle>>,
     pub by_port: HashMap<u16, Arc<SessionHandle>>,
-    /// 精确域名 → 会话（S1）
-    pub by_vhost_exact: HashMap<String, Arc<SessionHandle>>,
-    /// 通配域名 → 会话（S1）。键为去掉 `*.` 后的后缀，如 `alice.dev`
-    pub by_vhost_wildcard: HashMap<String, Arc<SessionHandle>>,
+    /// 精确域名 → 路由项（S1）
+    pub by_vhost_exact: HashMap<String, VhostEntry>,
+    /// 通配域名 → 路由项（S1）。键为去掉 `*.` 后的后缀，如 `alice.dev`
+    pub by_vhost_wildcard: HashMap<String, VhostEntry>,
+}
+
+/// 域名路由项：命中后足以定位代理并驱动一条隧道
+#[derive(Clone)]
+pub struct VhostEntry {
+    pub session: Arc<SessionHandle>,
+    /// 反查代理（NewConnection / ConnInit 需要）
+    pub proxy_name: String,
+    /// 注册时的代理类型：`Http` 只服务明文监听，`Https` 只服务 TLS 监听
+    pub kind: ProxyType,
 }
 
 /// 域名注册写入路由表时用的键，供会话结束时精确清理
@@ -105,10 +115,23 @@ pub fn normalize_host(host: &str) -> String {
     without_port.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// vhost 网关设置（S1）：决定 http/https 类型代理能否注册
+#[derive(Debug, Clone, Default)]
+pub struct VhostSettings {
+    /// `[http]` 明文监听是否启用
+    pub http: bool,
+    /// `[https]` TLS 监听是否启用
+    pub https: bool,
+    /// 子域名后缀（`subdomain_host`）
+    pub subdomain_host: Option<String>,
+}
+
 pub struct ServerState {
     pub policy: AuthPolicy,
     /// 代理端口监听地址
     pub bind_addr: String,
+    /// vhost 网关设置（S1）
+    pub vhost: VhostSettings,
     next_conn_id: AtomicU64,
     /// 注册临界区含 bind（await），用 tokio Mutex
     pub registry: tokio::sync::Mutex<Registry>,
@@ -121,10 +144,17 @@ impl ServerState {
         Self {
             policy,
             bind_addr,
+            vhost: VhostSettings::default(),
             next_conn_id: AtomicU64::new(1),
             registry: tokio::sync::Mutex::new(Registry::default()),
             pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 设置 vhost 网关（S1）
+    pub fn with_vhost(mut self, vhost: VhostSettings) -> Self {
+        self.vhost = vhost;
+        self
     }
 
     pub fn next_conn_id(&self) -> u64 {
@@ -217,7 +247,8 @@ pub struct RegisteredProxy {
     pub name: String,
     /// 服务端暴露端口。http/https 类型不占用端口（S1），故为可选
     pub port: Option<u16>,
-    pub listener: JoinHandle<()>,
+    /// 端口监听任务；域名型代理没有监听任务（S1），故为可选
+    pub listener: Option<JoinHandle<()>>,
     /// 本代理注册的域名键（S1）；会话结束时据此清理路由表
     pub vhosts: Vec<VhostKey>,
 }
@@ -237,15 +268,18 @@ pub async fn cleanup_session(state: &ServerState, session: &SessionHandle) {
             }
         }
         for vk in &p.vhosts {
+            let mine_entry = |e: &VhostEntry| e.session.id == session.id;
             if vk.wildcard {
-                if registry.by_vhost_wildcard.get(&vk.key).is_some_and(mine) {
+                if registry.by_vhost_wildcard.get(&vk.key).is_some_and(mine_entry) {
                     registry.by_vhost_wildcard.remove(&vk.key);
                 }
-            } else if registry.by_vhost_exact.get(&vk.key).is_some_and(mine) {
+            } else if registry.by_vhost_exact.get(&vk.key).is_some_and(mine_entry) {
                 registry.by_vhost_exact.remove(&vk.key);
             }
         }
-        p.listener.abort();
+        if let Some(task) = p.listener {
+            task.abort();
+        }
         tracing::info!(proxy = %p.name, port = ?p.port, domains = p.vhosts.len(), "proxy unregistered");
     }
 }

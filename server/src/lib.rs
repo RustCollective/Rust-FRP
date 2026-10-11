@@ -14,10 +14,10 @@ use anyhow::Result;
 use rfp_common::frame::{read_frame, write_frame};
 use rfp_common::msg::Message;
 use tokio::net::TcpListener;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub use config::ServerConfig;
-use state::{AuthPolicy, DataTransport, ServerState};
+use state::{AuthPolicy, DataTransport, ServerState, VhostSettings};
 
 /// 首帧（hello / conn_init）等待上限
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,7 +39,42 @@ pub async fn serve(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
         AuthPolicy::Legacy(_) => warn!("使用全局 token（legacy 模式），建议迁移到 [[users]] 授权"),
         AuthPolicy::Users(users) => info!(count = users.len(), "用户认证模式"),
     }
-    let state = Arc::new(ServerState::new(policy, cfg.bind_addr.clone()));
+    // S1：vhost 网关配置的结构性校验（证书配对在 CertTable::load 里拦）
+    cfg.validate()
+        .map_err(|e| anyhow::anyhow!("vhost 配置无效: {e}"))?;
+    let vhost_settings = VhostSettings {
+        http: cfg.http.is_some(),
+        https: cfg.https.is_some(),
+        subdomain_host: cfg.subdomain_host.clone(),
+    };
+    let state = Arc::new(
+        ServerState::new(policy, cfg.bind_addr.clone()).with_vhost(vhost_settings),
+    );
+
+    // S1：vhost 明文 HTTP 监听（h1 + h2c）
+    if let Some(h) = &cfg.http {
+        let addr = h.addr(&cfg.bind_addr);
+        let s = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = vhost::proxy::run_http(s, addr).await {
+                error!(error = %e, "vhost http 监听启动失败");
+            }
+        });
+    }
+    // S1：vhost TLS 监听（按 SNI 选证书；未命中的 SNI 拒绝握手）
+    if let Some(h) = &cfg.https {
+        let table = vhost::certs::CertTable::load(&cfg.certs)
+            .map_err(|e| anyhow::anyhow!("证书表加载失败: {e}"))?;
+        info!(count = table.len(), "vhost 证书表就绪");
+        let table = Arc::new(table);
+        let addr = h.addr(&cfg.bind_addr);
+        let s = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = vhost::proxy::run_https(s, addr, table).await {
+                error!(error = %e, "vhost https 监听启动失败");
+            }
+        });
+    }
     let tls_setup = if cfg.tls.enabled {
         Some(tls::setup(cfg.tls.cert.as_deref(), cfg.tls.key.as_deref())?)
     } else {

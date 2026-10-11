@@ -21,6 +21,7 @@ uuid.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
 rcgen.workspace = true
 quinn.workspace = true
 http.workspace = true

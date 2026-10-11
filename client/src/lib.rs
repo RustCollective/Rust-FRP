@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use quinn::crypto::rustls::QuicClientConfig;
 use rfp_common::frame::{control_framed, read_frame, recv_msg, send_msg, write_frame, Control};
-use rfp_common::msg::{version_compatible, Message, VERSION};
+use rfp_common::msg::{version_compatible, HttpInit, Message, VERSION};
 use rfp_common::now_ms;
 use rfp_common::quic::{QuicStream, ALPN};
 use rfp_common::AsyncStream;
@@ -25,7 +25,7 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
-use config::{ClientConfig, Transport};
+use config::{ClientConfig, ProxyConfig, Transport};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
@@ -225,10 +225,10 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
     handshake(&mut framed, &cfg).await?;
 
     // 转发循环
-    let proxies: Arc<HashMap<String, String>> = Arc::new(
+    let proxies: Arc<HashMap<String, ProxyConfig>> = Arc::new(
         cfg.proxies
             .iter()
-            .map(|p| (p.name.clone(), p.local_addr.clone()))
+            .map(|p| (p.name.clone(), p.clone()))
             .collect(),
     );
     let mut ping = interval(PING_INTERVAL);
@@ -252,6 +252,7 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
                             Arc::clone(&proxies),
                             conn_id,
                             proxy_name,
+                            http,
                         ));
                     }
                     Some(Message::Ping { ts }) => {
@@ -312,10 +313,10 @@ pub async fn run_quic_once(
         info!(session = %session_id, "connected (0-RTT)");
     }
 
-    let proxies: Arc<HashMap<String, String>> = Arc::new(
+    let proxies: Arc<HashMap<String, ProxyConfig>> = Arc::new(
         cfg.proxies
             .iter()
-            .map(|p| (p.name.clone(), p.local_addr.clone()))
+            .map(|p| (p.name.clone(), p.clone()))
             .collect(),
     );
     let mut ping = interval(PING_INTERVAL);
@@ -364,7 +365,7 @@ pub async fn run_quic_once(
 }
 
 /// server 下发的数据隧道：首帧 ConnInit 标识代理 → 拨本地服务 → 桥接。
-async fn handle_quic_data(mut stream: QuicStream, proxies: Arc<HashMap<String, String>>) {
+async fn handle_quic_data(mut stream: QuicStream, proxies: Arc<HashMap<String, ProxyConfig>>) {
     let first = match read_frame(&mut stream).await {
         Ok(b) => b,
         Err(e) => {
@@ -375,17 +376,25 @@ async fn handle_quic_data(mut stream: QuicStream, proxies: Arc<HashMap<String, S
     let Ok(Message::ConnInit {
         conn_id,
         proxy_name,
-        http: _,
+        http,
     }) = Message::parse(&first)
     else {
         warn!("quic data stream: unexpected first frame");
         return;
     };
     debug!(conn_id, proxy = %proxy_name, "quic data stream");
-    let Some(local_addr) = proxies.get(&proxy_name) else {
+    let Some(proxy) = proxies.get(&proxy_name) else {
         warn!(conn_id, proxy = %proxy_name, "no such proxy");
         return;
     };
+    // S1：域名型代理的数据流携带 HTTP 语义，走转发而不是裸字节桥接
+    if let Some(init) = http {
+        if let Err(e) = crate::forward::forward_http(conn_id, proxy, &init, stream).await {
+            warn!(conn_id, proxy = %proxy_name, error = %e, "http forward failed");
+        }
+        return;
+    }
+    let local_addr = proxy.local_addr.clone();
     let mut local = match TcpStream::connect(local_addr.as_str()).await {
         Ok(s) => s,
         Err(e) => {
@@ -407,11 +416,12 @@ async fn handle_new_conn(
     server_addr: String,
     server_port: u16,
     connector: Option<TlsConnector>,
-    proxies: Arc<HashMap<String, String>>,
+    proxies: Arc<HashMap<String, ProxyConfig>>,
     conn_id: u64,
     proxy_name: String,
+    http: Option<HttpInit>,
 ) {
-    let Some(local_addr) = proxies.get(&proxy_name) else {
+    let Some(proxy) = proxies.get(&proxy_name) else {
         warn!(conn_id, proxy = %proxy_name, "no such proxy");
         return;
     };
@@ -440,12 +450,20 @@ async fn handle_new_conn(
         },
         None => Box::new(tcp),
     };
-    // M1 数据连接：请求元数据已随控制通道的 new_connection 下发，此处不再携带
+    // 数据连接首帧只标识归属：请求元数据已随控制通道的 new_connection 下发
     let init = Message::ConnInit { conn_id, proxy_name, http: None };
     if let Err(e) = write_frame(&mut tunnel, &init.encode()).await {
         warn!(conn_id, error = %e, "send conn_init failed");
         return;
     }
+    // S1：域名型代理的数据流携带 HTTP 语义，走转发而不是裸字节桥接
+    if let Some(meta) = http {
+        if let Err(e) = crate::forward::forward_http(conn_id, proxy, &meta, tunnel).await {
+            warn!(conn_id, error = %e, "http forward failed");
+        }
+        return;
+    }
+    let local_addr = proxy.local_addr.clone();
     let mut local = match TcpStream::connect(local_addr.as_str()).await {
         Ok(s) => s,
         Err(e) => {

@@ -136,6 +136,57 @@ pub fn connector(fingerprint: Option<&str>) -> Result<TlsConnector> {
     )?)))
 }
 
+/// 接受任意服务端证书的校验器。
+///
+/// **仅用于 `[proxies.local_tls] verify = "skip"`**：隧道 TLS 与「客户端→本地服务」
+/// 是相互独立的两跳，放宽后一跳不削弱外网侧的安全性。调用点会以 warn 级别提示
+/// （宪法原则 III：放宽必须显式声明）。
+#[derive(Debug)]
+struct AcceptAnyVerifier;
+
+impl ServerCertVerifier for AcceptAnyVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_handshake_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_handshake_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        ring_algs().supported_schemes()
+    }
+}
+
+/// 跳过证书校验的客户端配置（`local_tls.verify = "skip"`）
+pub fn rustls_insecure_config() -> ClientConfig {
+    ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
+        .with_no_client_auth()
+}
+
 /// 系统根证书（读常见 CA bundle；自签场景反正靠 pinning）
 fn root_store() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();

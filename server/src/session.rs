@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rfp_common::frame::{control_framed, recv_msg, send_msg, write_frame};
-use rfp_common::msg::{version_compatible, Message, ProxyType, VERSION};
+use rfp_common::msg::{version_compatible, HttpInit, Message, ProxyType, VERSION};
 use rfp_common::now_ms;
 use rfp_common::quic::QuicStream;
 use tokio::net::TcpListener;
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::state::{
     authorize_port, authorize_vhost, cleanup_session, AsyncStream, BoxedStream, DataTransport,
-    RegisteredProxy, ServerState, SessionHandle,
+    RegisteredProxy, ServerState, SessionHandle, VhostEntry,
 };
 
 /// new_connection 发出后等待 conn_init 的窗口
@@ -110,8 +110,15 @@ pub async fn handle_control<S: AsyncStream>(
                         break;
                     }
                     Ok(None) => break,
-                    // vhosts / subdomain 由 S1（US1）的注册路径消费，此处暂不解构
-                    Ok(Some(Message::RegisterProxy { name, proxy_type, local_addr, remote_port, vhost, .. })) => {
+                    Ok(Some(Message::RegisterProxy {
+                        name,
+                        proxy_type,
+                        local_addr,
+                        remote_port,
+                        vhost,
+                        vhosts,
+                        subdomain,
+                    })) => {
                         let result = register_proxy(
                             &state,
                             &handle,
@@ -119,11 +126,13 @@ pub async fn handle_control<S: AsyncStream>(
                             proxy_type,
                             remote_port,
                             vhost.as_deref(),
+                            &vhosts,
+                            subdomain.as_deref(),
                         )
                         .await;
                         let ack = match result {
                             Ok(port) => {
-                                info!(session = %session_id, proxy = %name, port, local_addr = %local_addr, "proxy registered");
+                                info!(session = %session_id, proxy = %name, port = ?port, local_addr = %local_addr, "proxy registered");
                                 Message::RegisterProxyAck { name, ok: true, error: None }
                             }
                             Err(err) => {
@@ -166,7 +175,20 @@ pub async fn handle_control<S: AsyncStream>(
     info!(session = %session_id, "session closed");
 }
 
-/// 校验并注册代理：授权检查 + 名称/端口冲突检查 + 绑定监听 + 注册表登记。
+fn type_name(t: ProxyType) -> &'static str {
+    match t {
+        ProxyType::Tcp => "tcp",
+        ProxyType::Udp => "udp",
+        ProxyType::Http => "http",
+        ProxyType::Https => "https",
+    }
+}
+
+/// 校验并注册代理，按类型分派。
+///
+/// 返回服务端实际暴露的端口：`tcp` 为具体端口，`http`/`https` 为 `None`
+/// （域名型代理不占用公网端口，FR-001）。
+#[allow(clippy::too_many_arguments)]
 async fn register_proxy(
     state: &Arc<ServerState>,
     session: &Arc<SessionHandle>,
@@ -174,10 +196,130 @@ async fn register_proxy(
     proxy_type: ProxyType,
     remote_port: Option<u16>,
     vhost: Option<&str>,
-) -> Result<u16, String> {
-    if proxy_type != ProxyType::Tcp {
-        return Err("M1 仅支持 tcp 代理".into());
+    vhosts: &[String],
+    subdomain: Option<&str>,
+) -> Result<Option<u16>, String> {
+    match proxy_type {
+        ProxyType::Tcp => register_tcp(state, session, name, remote_port, vhost)
+            .await
+            .map(Some),
+        ProxyType::Http | ProxyType::Https => {
+            register_vhost(state, session, name, proxy_type, vhost, vhosts, subdomain).await?;
+            Ok(None)
+        }
+        ProxyType::Udp => Err(format!(
+            "{} 代理尚未支持（见 specs/001-frp-parity US2）",
+            type_name(ProxyType::Udp)
+        )),
     }
+}
+
+/// 域名型代理注册（S1）：监听端口已配置 → 域名授权 → 冲突 → 原子登记。
+///
+/// 错误原因按 `contracts/rfp1-http-vhost.md` §2 的表格分列，便于客户端直接展示。
+#[allow(clippy::too_many_arguments)]
+async fn register_vhost(
+    state: &Arc<ServerState>,
+    session: &Arc<SessionHandle>,
+    name: &str,
+    proxy_type: ProxyType,
+    vhost: Option<&str>,
+    vhosts: &[String],
+    subdomain: Option<&str>,
+) -> Result<(), String> {
+    // 1. 对应监听端口必须已配置，否则注册成功也访问不通
+    let enabled = match proxy_type {
+        ProxyType::Http => state.vhost.http,
+        ProxyType::Https => state.vhost.https,
+        _ => unreachable!("register_vhost 只处理 http/https"),
+    };
+    if !enabled {
+        let section = if proxy_type == ProxyType::Http {
+            "[http] bind_port"
+        } else {
+            "[https] bind_port"
+        };
+        return Err(format!(
+            "服务端未配置 {section}，无法注册 {} 类型代理",
+            type_name(proxy_type)
+        ));
+    }
+
+    // 2. 汇总域名：vhost 与 vhosts 取并集，subdomain 展开为完整域名
+    let mut domains: Vec<String> = Vec::new();
+    if let Some(v) = vhost {
+        domains.push(v.to_string());
+    }
+    domains.extend(vhosts.iter().cloned());
+    if let Some(tag) = subdomain {
+        let Some(host) = state.vhost.subdomain_host.as_deref() else {
+            return Err("服务端未配置 subdomain_host，不能用 subdomain 注册".into());
+        };
+        domains.push(format!("{tag}.{host}"));
+    }
+    if domains.is_empty() {
+        return Err("http/https 类型必须声明至少一个域名（vhost / vhosts / subdomain）".into());
+    }
+
+    // 3. 逐个归一化 + 授权检查
+    let mut keys = Vec::with_capacity(domains.len());
+    for d in &domains {
+        let Some(k) = crate::vhost::router::vhost_key(d) else {
+            return Err(format!("域名 `{d}` 无效"));
+        };
+        authorize_vhost(&session.identity, d)?;
+        keys.push(k);
+    }
+
+    // 4. 冲突检查与登记在同一临界区内完成（登记前不释放锁）
+    let mut registry = state.registry.lock().await;
+    if registry.by_name.contains_key(name) {
+        return Err("同名代理已存在".into());
+    }
+    for (d, k) in domains.iter().zip(keys.iter()) {
+        let owner = if k.wildcard {
+            registry.by_vhost_wildcard.get(&k.key)
+        } else {
+            registry.by_vhost_exact.get(&k.key)
+        };
+        if let Some(e) = owner {
+            return Err(format!("域名 `{d}` 已被会话 {} 注册", e.session.id));
+        }
+    }
+    for k in &keys {
+        let entry = VhostEntry {
+            session: Arc::clone(session),
+            proxy_name: name.to_string(),
+            kind: proxy_type,
+        };
+        if k.wildcard {
+            registry.by_vhost_wildcard.insert(k.key.clone(), entry);
+        } else {
+            registry.by_vhost_exact.insert(k.key.clone(), entry);
+        }
+    }
+    registry.by_name.insert(name.to_string(), Arc::clone(session));
+    drop(registry);
+
+    session.registered.lock().unwrap().push(RegisteredProxy {
+        name: name.to_string(),
+        port: None,
+        // 域名型代理没有端口监听任务
+        listener: None,
+        vhosts: keys,
+    });
+    info!(proxy = %name, kind = %type_name(proxy_type), domains = ?domains, "vhost proxy registered");
+    Ok(())
+}
+
+/// TCP 型代理注册：授权检查 + 名称/端口冲突检查 + 绑定监听 + 注册表登记。
+async fn register_tcp(
+    state: &Arc<ServerState>,
+    session: &Arc<SessionHandle>,
+    name: &str,
+    remote_port: Option<u16>,
+    vhost: Option<&str>,
+) -> Result<u16, String> {
     let Some(port) = remote_port else {
         return Err("tcp 代理需要 remote_port".into());
     };
@@ -214,7 +356,7 @@ async fn register_proxy(
     session.registered.lock().unwrap().push(RegisteredProxy {
         name: name.to_string(),
         port: Some(port),
-        listener: task,
+        listener: Some(task),
         // TCP 代理不注册域名；域名路由见 S1（US1）
         vhosts: vec![],
     });
@@ -256,29 +398,52 @@ async fn relay(
     mut user: tokio::net::TcpStream,
 ) {
     let conn_id = state.next_conn_id();
-    let mut tunnel: BoxedStream = match &session.data {
+    let Some(mut tunnel) = open_tunnel(&state, &session, conn_id, &proxy_name, None).await else {
+        return;
+    };
+    match tokio::io::copy_bidirectional(&mut user, &mut tunnel).await {
+        Ok((up, down)) => debug!(conn_id, up, down, "connection closed"),
+        Err(e) => debug!(conn_id, error = %e, "connection error"),
+    }
+}
+
+/// 为一次转发取得隧道流（S1 起同时供 vhost 网关复用）。
+///
+/// - `DataTransport::Tcp`：控制通道下发 `NewConnection`（可携带 HTTP 元数据），
+///   等客户端回连并经 `pending` 表按 `conn_id` 移交。
+/// - `DataTransport::Quic`：在既有连接上 `open_bi`，首帧 `ConnInit` 携带 HTTP 元数据。
+///
+/// 两条路径都保证「客户端开始读请求体之前，请求元数据必然已到达」——
+/// 这是 `contracts/rfp1-http-vhost.md` §3 的硬性约束。
+pub(crate) async fn open_tunnel(
+    state: &Arc<ServerState>,
+    session: &Arc<SessionHandle>,
+    conn_id: u64,
+    proxy_name: &str,
+    http: Option<HttpInit>,
+) -> Option<BoxedStream> {
+    match &session.data {
         // M1 TCP：通知 client 回连，经 pending 表匹配移交
         DataTransport::Tcp => {
             if session
                 .cmd_tx
                 .send(Message::NewConnection {
                     conn_id,
-                    proxy_name: proxy_name.clone(),
-                    // HTTP 类型代理的请求元数据由 S1（T041）在此填充
-                    http: None,
+                    proxy_name: proxy_name.to_string(),
+                    http,
                 })
                 .is_err()
             {
-                return; // 会话已死，关闭用户连接
+                return None; // 会话已死
             }
             let (tx, rx) = oneshot::channel();
             state.pending.lock().unwrap().insert(conn_id, tx);
             match tokio::time::timeout(PENDING_TIMEOUT, rx).await {
-                Ok(Ok(t)) => t,
+                Ok(Ok(t)) => Some(t),
                 _ => {
                     state.pending.lock().unwrap().remove(&conn_id);
                     debug!(conn_id, "tunnel conn timeout or aborted");
-                    return;
+                    None
                 }
             }
         }
@@ -288,24 +453,19 @@ async fn relay(
                 Ok(s) => QuicStream::from(s),
                 Err(e) => {
                     debug!(conn_id, error = %e, "quic open_bi failed");
-                    return;
+                    return None;
                 }
             };
             let init = Message::ConnInit {
                 conn_id,
-                proxy_name: proxy_name.clone(),
-                // HTTP 类型代理的请求元数据由 S1（T042）在此填充
-                http: None,
+                proxy_name: proxy_name.to_string(),
+                http,
             };
             if let Err(e) = write_frame(&mut stream, &init.encode()).await {
                 debug!(conn_id, error = %e, "quic conn_init write failed");
-                return;
+                return None;
             }
-            Box::new(stream)
+            Some(Box::new(stream))
         }
-    };
-    match tokio::io::copy_bidirectional(&mut user, &mut tunnel).await {
-        Ok((up, down)) => debug!(conn_id, up, down, "connection closed"),
-        Err(e) => debug!(conn_id, error = %e, "connection error"),
     }
 }
