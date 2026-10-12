@@ -12,6 +12,7 @@ fn default_bind_addr() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// 监听地址（控制/数据连接与代理端口共用）
     #[serde(default = "default_bind_addr")]
@@ -48,6 +49,7 @@ pub struct ServerConfig {
 
 /// UDP 代理段（`[udp]`，S2）
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UdpConfig {
     /// 会话空闲回收阈值（秒）。静默超过该值的会话被回收，
     /// 同源端口随后再发包会重建会话。
@@ -69,6 +71,7 @@ fn default_udp_idle_secs() -> u64 {
 
 /// vhost 监听段（`[http]` / `[https]`）
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VhostListener {
     pub bind_port: u16,
     /// 缺省复用全局 `bind_addr`
@@ -89,6 +92,7 @@ impl VhostListener {
 
 /// 域名证书项（`[[certs]]`）
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertEntry {
     /// 域名，支持 `*.example.com` 通配；匹配语义由 rustls 决定
     pub domain: String,
@@ -99,6 +103,7 @@ pub struct CertEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// 默认 true；false = 明文模式（不推荐，仅调试用）
     #[serde(default = "default_true")]
@@ -125,6 +130,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuicConfig {
     /// 默认 false；QUIC 需要安全组额外放行 UDP
     #[serde(default)]
@@ -143,6 +149,7 @@ impl ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserConfig {
     pub name: String,
     pub token: String,
@@ -270,6 +277,27 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F6 回归：键写错位置必须当场报错，不能被 TOML 段静默吞掉。
+    ///
+    /// 2026-10-12 真实链路验收踩过：`subdomain_host` 写在 `[https]` 之后会被 TOML
+    /// 归入该段，根级就没有这个键，报错却是"服务端未配置 subdomain_host"——
+    /// 指向错误的方向。现在解析期直接失败并点名该键。
+    #[test]
+    fn misplaced_or_unknown_key_is_rejected() {
+        let err = toml::from_str::<ServerConfig>(
+            "bind_port = 7000\n[https]\nbind_port = 8443\nsubdomain_host = \"example.com\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("subdomain_host"), "错误信息未点名问题键: {err}");
+
+        // 顶层键拼错同样当场报错，而不是拿默认值静默跑起来
+        let err = toml::from_str::<ServerConfig>("bind_port = 7000\nbnd_addr = \"0.0.0.0\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bnd_addr"), "错误信息未点名问题键: {err}");
+    }
 
     #[test]
     fn port_spec_parse() {

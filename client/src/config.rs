@@ -17,6 +17,7 @@ pub enum Transport {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     /// 服务端地址（IP 或域名）
     pub server_addr: String,
@@ -34,6 +35,7 @@ pub struct ClientConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// 默认 true；false = 明文模式（不推荐，仅调试用）
     #[serde(default = "default_true")]
@@ -57,6 +59,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -79,6 +82,7 @@ pub struct ProxyConfig {
 
 /// 客户端 → 本地服务 的 TLS 设置（与隧道 TLS 相互独立）
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalTlsConfig {
     /// 默认 false，即按明文 HTTP 访问本地服务
     #[serde(default)]
@@ -382,6 +386,39 @@ fingerprint = "aa11"
         )
         .unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    /// F6 回归（客户端侧）：未知 / 拼错的键当场报错，不静默按默认值跑
+    #[test]
+    fn unknown_or_misplaced_key_is_rejected() {
+        let err = parse(
+            r#"
+server_addr = "1.2.3.4"
+server_prot = 7000
+[[proxies]]
+name = "ssh"
+type = "tcp"
+local_addr = "127.0.0.1:22"
+remote_port = 6022
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("server_prot"), "错误信息未点名问题键: {err}");
+
+        // 代理段的键写错位置（放到根级）同样报错
+        let err = parse(
+            r#"
+server_addr = "1.2.3.4"
+local_addr = "127.0.0.1:22"
+[[proxies]]
+name = "ssh"
+type = "tcp"
+local_addr = "127.0.0.1:22"
+remote_port = 6022
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("local_addr"), "错误信息未点名问题键: {err}");
     }
 
     #[test]
