@@ -5,6 +5,8 @@
 //! 关键约束：
 //! - 请求体 / 响应体全程流式，**不整体缓冲**（FR-011、SC-007）；
 //! - 元数据帧必须是各方向在数据流上的第一条消息（契约 §3.3）；
+//! - 体是**显式分帧**的：`N 个长度前缀体帧 + 一个 0 长度 EOB 帧`，
+//!   两个方向同构，**不用半关闭表达体结束**（契约 §3.3，research D11）；
 //! - 逐跳头两个方向都剥离，转发头只追加不覆盖（FR-004、FR-005）。
 
 use std::convert::Infallible;
@@ -22,9 +24,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rfp_common::frame::{read_frame, MAX_FRAME};
+use rfp_common::frame::{read_frame, write_frame, MAX_FRAME};
 use rfp_common::msg::{HttpInit, Message, ProxyType};
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
@@ -34,6 +36,13 @@ use crate::vhost::router;
 
 /// 等响应元数据的上限（客户端要拨号 + 拿到本地服务的响应头）
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 体帧的单帧载荷上限：帧协议允许 64 KiB，实现取 16 KiB
+/// （与 hyper 的读缓冲同量级，背压粒度更细）
+const BODY_CHUNK: usize = 16 * 1024;
+
+/// 响应方向排空的上限：对端卡死时不能让隧道一直挂着
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 逐跳头：两个方向都必须剥离，不能原样透传（FR-004）
 const HOP_BY_HOP: &[&str] = &[
@@ -227,7 +236,7 @@ async fn bridge(
     };
 
     let (mut rd, wr) = tokio::io::split(tunnel);
-    // 请求体泵：读完即半关闭，客户端据此判定请求结束
+    // 请求体泵：按帧写请求体，末尾补 0 长度 EOB 帧表达体结束（契约 §3.3）
     let pump = tokio::spawn(pump_request(body, wr));
 
     // 响应元数据必须是客户端方向的第一条消息
@@ -265,7 +274,7 @@ async fn bridge(
         }
     }
 
-    let body = TunnelBody { rd, pump };
+    let body = TunnelBody::new(rd, pump);
     match builder.body(UnsyncBoxBody::new(body)) {
         Ok(resp) => {
             info!(conn_id, proxy = %proxy_name, kind = ?kind, %peer, "vhost 转发完成头处理");
@@ -291,36 +300,75 @@ fn empty_body() -> ResBody {
     UnsyncBoxBody::new(Empty::<Bytes>::new().map_err(|e: Infallible| match e {}))
 }
 
-/// 把请求体逐块写进隧道，读完即半关闭。
+/// 把请求体按帧写进隧道，读完补一个 0 长度帧（EOB）表达请求体结束。
 ///
 /// **不能整体缓冲**：1GB 上传会把服务端内存撑爆（FR-011、SC-007）。
+///
+/// 这里刻意**不做半关闭**：写侧一直开到最后释放整条隧道为止。半关闭会让客户端
+/// 在请求体结束时就看到读方向 EOF，之后它就无法再用「对端关闭」判断响应是否已被
+/// 读完——2026-10-12 真实链路验收的大响应截断（F3）正是这个竞态，见 research D11。
 async fn pump_request(mut body: Incoming, mut wr: tokio::io::WriteHalf<BoxedStream>) {
     loop {
         match body.frame().await {
             None => break,
             Some(Ok(f)) => {
-                if let Some(chunk) = f.data_ref() {
-                    if wr.write_all(chunk).await.is_err() {
-                        break;
+                let Some(chunk) = f.data_ref() else { continue };
+                for part in chunk.chunks(BODY_CHUNK) {
+                    if write_frame(&mut wr, part).await.is_err() {
+                        // 隧道已断：客户端不会再收到完整请求体，不补 EOB
+                        return;
                     }
                 }
             }
             Some(Err(e)) => {
                 debug!(error = %e, "读取请求体失败");
-                break;
+                return;
             }
         }
     }
-    let _ = wr.shutdown().await;
+    if let Err(e) = write_frame(&mut wr, &[]).await {
+        debug!(error = %e, "写入请求体结束帧失败");
+    }
 }
 
-/// 把隧道读端包成 hyper 的响应体：逐块读取，不缓冲整包。
+/// 把隧道读端包成 hyper 的响应体：**按帧**读取，读到 0 长度帧（EOB）即响应体结束。
 ///
 /// 持有请求泵的句柄，响应结束时一并取消——否则客户端提前应答时，
 /// 泵会卡在一个没人读的隧道写端上。
 struct TunnelBody {
-    rd: tokio::io::ReadHalf<BoxedStream>,
+    rd: Option<tokio::io::ReadHalf<BoxedStream>>,
     pump: tokio::task::JoinHandle<()>,
+    /// 帧头（u32 大端长度前缀）已读字节数
+    hdr: [u8; 4],
+    hdr_len: usize,
+    /// 当前帧剩余的未读字节；`None` 表示尚在读帧头
+    remaining: Option<usize>,
+    /// 帧体读缓冲
+    buf: Box<[u8; BODY_CHUNK]>,
+    /// 是否已读到 EOB
+    eob: bool,
+}
+
+impl TunnelBody {
+    fn new(rd: tokio::io::ReadHalf<BoxedStream>, pump: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            rd: Some(rd),
+            pump,
+            hdr: [0; 4],
+            hdr_len: 0,
+            remaining: None,
+            buf: Box::new([0; BODY_CHUNK]),
+            eob: false,
+        }
+    }
+
+    /// 读方向读到 EOF 却不是 EOB：按截断报错，不静默当体结束
+    fn truncated() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "tunnel closed before end-of-body marker",
+        )
+    }
 }
 
 impl Body for TunnelBody {
@@ -332,38 +380,98 @@ impl Body for TunnelBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        let mut buf = [0u8; 16 * 1024];
-        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
-        match Pin::new(&mut this.rd).poll_read(cx, &mut read_buf) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(Ok(())) => {
-                let filled = read_buf.filled();
-                if filled.is_empty() {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(filled)))))
+        let rd = this.rd.as_mut().expect("rd 只在 drop 时取出");
+        loop {
+            // 上一帧正好读完（remaining 归零）：复位，下一轮读新帧头。
+            // 漏掉这一步会用**空缓冲**继续 poll（0 长度 ReadBuf 永远读不出东西），
+            // 表现为响应体卡死不收尾。
+            if this.remaining == Some(0) {
+                this.remaining = None;
+            }
+            match this.remaining {
+                // 1) 读帧头
+                None => {
+                    while this.hdr_len < 4 {
+                        let mut buf = tokio::io::ReadBuf::new(&mut this.hdr[this.hdr_len..]);
+                        match Pin::new(&mut *rd).poll_read(cx, &mut buf) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                            Poll::Ready(Ok(())) => {
+                                let n = buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Some(Err(Self::truncated())));
+                                }
+                                this.hdr_len += n;
+                            }
+                        }
+                    }
+                    let len = u32::from_be_bytes(this.hdr) as usize;
+                    this.hdr_len = 0;
+                    if len == 0 {
+                        // EOB：响应体结束
+                        this.eob = true;
+                        return Poll::Ready(None);
+                    }
+                    if len > MAX_FRAME {
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "body frame exceeds 64 KiB",
+                        ))));
+                    }
+                    this.remaining = Some(len);
+                }
+                // 2) 读帧体
+                Some(remaining) => {
+                    let want = remaining.min(this.buf.len());
+                    let mut buf = tokio::io::ReadBuf::new(&mut this.buf[..want]);
+                    match Pin::new(&mut *rd).poll_read(cx, &mut buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Ready(Ok(())) => {
+                            let n = buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Some(Err(Self::truncated())));
+                            }
+                            this.remaining = Some(remaining - n);
+                            let data = Bytes::copy_from_slice(&this.buf[..n]);
+                            return Poll::Ready(Some(Ok(Frame::data(data))));
+                        }
+                    }
                 }
             }
         }
     }
 
     fn size_hint(&self) -> SizeHint {
-        // 长度未知：让 hyper 用分块编码，内容长度以客户端给出的响应头为准
+        // 长度未知：让 hyper 按元数据里的 content-length 收尾，缺省走分块编码
         SizeHint::default()
     }
 }
 
 impl Drop for TunnelBody {
     fn drop(&mut self) {
-        self.drain();
-    }
-}
-
-impl TunnelBody {
-    /// 响应结束：停掉请求泵（握手的另一半不该继续等一个没人读的对端）
-    fn drain(&self) {
+        // 响应结束：停掉请求泵（握手的另一半不该继续等一个没人读的对端）
         self.pump.abort();
+        let Some(mut rd) = self.rd.take() else { return };
+        if self.eob {
+            // 本方向已读到 EOB：没有未读数据，直接释放即可
+            return;
+        }
+        // 响应体没被读完（典型情况：hyper 按 content-length 提前收尾，EOB 帧还在
+        // 隧道里）。先把剩余部分排空再让 socket 关闭——**带着未读数据关闭会让内核
+        // 发 RST，把对端还在途的数据丢掉**（F3 的根因，research D11）。客户端的
+        // 「写完响应后等对端关闭」也依赖这里：它看到关闭就说明服务端已读完。
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+                while let Ok(n) = rd.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            })
+            .await;
+        });
     }
 }
 

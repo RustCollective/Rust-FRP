@@ -2,15 +2,17 @@
 //!
 //! 承载契约见 `specs/001-frp-parity/contracts/rfp1-http-vhost.md` §3：
 //! 请求元数据（M1 来自控制通道的 `new_connection`、M2 来自数据流首帧的
-//! `conn_init`）之后，隧道上**裸请求体**直到半关闭；客户端回写时以
-//! `http_response_meta` 作为该方向的**第一条消息**，随后是裸响应体。
+//! `conn_init`）之后是**按帧承载的请求体**（`N 个长度前缀体帧 + 0 长度 EOB 帧`）；
+//! 客户端回写时以 `http_response_meta` 作为该方向的**第一条消息**，随后是同样
+//! 分帧的响应体。体结束由 EOB 帧表达，不用半关闭（research D11）。
 //!
-//! 全程流式：请求体直接由隧道读端驱动 hyper 客户端的请求体，
-//! 不落地、不聚合（FR-011、SC-007）。
+//! 全程流式：请求体由隧道读端按帧驱动 hyper 客户端的请求体（容量 1 的通道，
+//! 背压一路传到访客），不落地、不聚合（FR-011、SC-007）。
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
 use http_body_util::BodyExt;
@@ -21,8 +23,9 @@ use hyper_util::rt::TokioIo;
 use rfp_common::frame::{read_frame, write_frame, MAX_FRAME};
 use rfp_common::msg::{HttpInit, Message};
 use rfp_common::BoxedStream;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
@@ -31,10 +34,22 @@ use crate::config::{LocalTlsConfig, LocalTlsVerify, ProxyConfig};
 /// UDP 数据报读取缓冲：UDP 理论最大载荷 65507，取 64 KiB 足够
 const DATAGRAM_MAX: usize = 64 * 1024;
 
+/// 体帧的单帧载荷上限：帧协议允许 64 KiB，实现取 16 KiB
+/// （与服务端 `vhost::proxy` 保持一致，背压粒度更细）
+const BODY_CHUNK: usize = 16 * 1024;
+
+/// 关序等待上限：写完响应后等对端读完并关闭隧道（服务端读完响应即关闭）
+const CLOSE_WAIT: Duration = Duration::from_secs(30);
+
 /// 隧道的请求元数据 → 本地服务 → 响应回写。
 ///
 /// `stream` 是已就绪的隧道（M1 回连连接 / M2 bi-stream），元数据帧已由调用方读完；
 /// `init` 是随元数据下发的 method / path / headers。
+///
+/// 体是**显式分帧**的（`N 个长度前缀体帧 + 0 长度 EOB 帧`，契约 §3.3）：
+/// 请求体读到 EOB 才结束，响应体写完补 EOB，**不靠半关闭表达体结束**。
+/// 写完响应后还要等读方向结束（服务端读完响应并关闭隧道）才释放 socket——
+/// 否则内核会用 RST 丢掉在途数据（research D11 的 F3）。
 pub async fn forward_http<S>(
     conn_id: u64,
     proxy: &ProxyConfig,
@@ -47,7 +62,15 @@ where
     let local_addr = proxy.local_addr.clone();
     let (rd, mut wr) = tokio::io::split(stream);
 
-    // 1. 拨号本地服务（隧道 TLS 与本地 TLS 是两跳，策略独立）
+    // 1. 请求体：由独立任务按帧读取，经容量 1 的通道交给 hyper。
+    //
+    //    容量 1 是有意的：它把「隧道读」与「本地服务消费」耦合起来，形成端到端
+    //    背压（不引入无界缓冲，FR-011、SC-007）。请求体读到 EOB 后该任务继续把
+    //    读方向排空到 EOF——服务端读完响应才会关闭隧道，这就是关序确认。
+    let (tx, rx) = mpsc::channel::<Bytes>(1);
+    let reader = tokio::spawn(read_body_frames(rd, tx));
+
+    // 2. 拨号本地服务（隧道 TLS 与本地 TLS 是两跳，策略独立）
     let tcp = TcpStream::connect(local_addr.as_str())
         .await
         .with_context(|| format!("连接本地服务 {local_addr} 失败"))?;
@@ -64,7 +87,7 @@ where
         Box::new(tcp)
     };
 
-    // 2. 请求行与请求头由服务端经隧道元数据下发，这里只负责还原成 h1 请求
+    // 3. 请求行与请求头由服务端经隧道元数据下发，这里只负责还原成 h1 请求
     let mut builder = Request::builder();
     for (name, value) in &init.headers {
         match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
@@ -76,10 +99,10 @@ where
     let req = builder
         .method(init.method.as_str())
         .uri(init.path.as_str())
-        .body(TunnelBody::new(rd, length))
+        .body(ChannelBody::new(rx, length))
         .with_context(|| format!("构造本地请求 {} {} 失败", init.method, init.path))?;
 
-    // 3. h1 客户端连本地服务
+    // 4. h1 客户端连本地服务
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
         .await
         .context("与本地服务完成 HTTP/1.1 握手失败")?;
@@ -91,7 +114,7 @@ where
 
     let resp = sender.send_request(req).await.context("本地服务请求失败")?;
 
-    // 4. 响应元数据必须是客户端方向的第一条消息
+    // 5. 响应元数据必须是客户端方向的第一条消息
     let (parts, body) = resp.into_parts();
     let headers = strip_hop_by_hop(&parts.headers);
     let meta = Message::HttpResponseMeta {
@@ -103,16 +126,71 @@ where
         .await
         .context("回写响应元数据失败")?;
 
-    // 5. 响应体流式回写，结束即半关闭
+    // 6. 响应体流式分帧回写，最后补 0 长度 EOB 帧表达体结束
     let mut body = body;
     while let Some(frame) = body.frame().await {
         let frame = frame.context("读取本地服务响应体失败")?;
-        if let Some(chunk) = frame.data_ref() {
-            wr.write_all(chunk).await.context("回写响应体失败")?;
+        let Some(chunk) = frame.data_ref() else { continue };
+        for part in chunk.chunks(BODY_CHUNK) {
+            write_frame(&mut wr, part).await.context("回写响应体失败")?;
         }
     }
+    write_frame(&mut wr, &[])
+        .await
+        .context("写入响应体结束帧失败")?;
+    // 关掉写方向（对端仍可继续读），随后等它读完并关闭隧道
     let _ = wr.shutdown().await;
+
+    // 7. 关序：服务端读完响应（读到 EOB）后才会关闭隧道并把剩余字节排空，
+    //    这里等它——提前释放 socket 会以 RST 丢掉尚未送达的尾部（F3）。
+    match tokio::time::timeout(CLOSE_WAIT, reader).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(conn_id, error = %e, "请求体读取任务异常结束"),
+        Err(_) => warn!(conn_id, "等待服务端读完响应超时，隧道将直接释放"),
+    }
     Ok(())
+}
+
+/// 按帧读取请求体，交给 hyper 的请求体消费。
+///
+/// 读到 0 长度帧（EOB）即请求体结束，随后**继续把读方向排空到 EOF**：
+/// 服务端读完响应、关闭隧道后这里才会返回，这个「读到结束」就是响应已送达的
+/// 确认（契约 §3.3 的关序约束）。本地服务提前应答（不再消费请求体）时同样转入
+/// 排空——带着未读数据关闭 socket 会让内核发 RST，把在途响应丢掉。
+async fn read_body_frames<S>(mut rd: tokio::io::ReadHalf<S>, tx: mpsc::Sender<Bytes>)
+where
+    S: AsyncRead + Unpin,
+{
+    loop {
+        match read_frame(&mut rd).await {
+            Ok(f) if f.is_empty() => break, // EOB：请求体结束
+            Ok(f) => {
+                if tx.send(Bytes::from(f)).await.is_err() {
+                    // 消费方已退出（本地服务提前应答）
+                    break;
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "读取请求体帧失败");
+                return; // 隧道已断，无需排空
+            }
+        }
+    }
+    drop(tx); // 请求体结束：让 hyper 看到 body 结束而不是继续等
+    drain_until_eof(rd).await;
+}
+
+/// 把读方向排空到 EOF / 错误为止（不做解析，只消费字节）
+async fn drain_until_eof<S>(mut rd: tokio::io::ReadHalf<S>)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = rd.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+    }
 }
 
 /// UDP 代理的转发：每个会话一个本地 UDP socket，隧道内数据报保持边界（S2）。
@@ -181,23 +259,31 @@ fn local_tls_connector(cfg: &LocalTlsConfig) -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-/// 把隧道读端包成 hyper 请求体：由隧道字节直接驱动本地请求，不缓冲整包。
-struct TunnelBody<S> {
-    rd: tokio::io::ReadHalf<S>,
+/// hyper 请求体：消费请求体帧通道，通道关闭（EOB 到达）即体结束。
+///
+/// 通道是容量 1 的有界通道——`read_body_frames` 因此不会跑在本地服务前面，
+/// 隧道层的背压一路传到访客（FR-011、SC-007）。
+struct ChannelBody {
+    rx: mpsc::Receiver<Bytes>,
     /// 已知的内容长度（来自元数据里的 `content-length`）。
     ///
     /// 给出确切长度能让 hyper 用 Content-Length 而非 chunked 编码发往本地服务——
     /// 部分简易 origin（如 `python3 -m http.server`）不认 chunked。
     expected: Option<u64>,
+    done: bool,
 }
 
-impl<S> TunnelBody<S> {
-    fn new(rd: tokio::io::ReadHalf<S>, expected: Option<u64>) -> Self {
-        Self { rd, expected }
+impl ChannelBody {
+    fn new(rx: mpsc::Receiver<Bytes>, expected: Option<u64>) -> Self {
+        Self {
+            rx,
+            expected,
+            done: false,
+        }
     }
 }
 
-impl<S: AsyncRead> Body for TunnelBody<S> {
+impl Body for ChannelBody {
     type Data = Bytes;
     type Error = std::io::Error;
 
@@ -206,24 +292,21 @@ impl<S: AsyncRead> Body for TunnelBody<S> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        if this.expected == Some(0) {
+        if this.done || this.expected == Some(0) {
             return Poll::Ready(None);
         }
-        let mut buf = [0u8; 16 * 1024];
-        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
-        match Pin::new(&mut this.rd).poll_read(cx, &mut read_buf) {
+        match this.rx.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(Ok(())) => {
-                let filled = read_buf.filled();
-                if filled.is_empty() {
-                    return Poll::Ready(None);
-                }
+            Poll::Ready(Some(chunk)) => {
                 if let Some(rest) = this.expected.as_mut() {
-                    let n = (*rest).min(filled.len() as u64);
-                    *rest -= n;
+                    *rest = rest.saturating_sub(chunk.len() as u64);
                 }
-                Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(filled)))))
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            // 通道关闭 = 读到 EOB，请求体结束
+            Poll::Ready(None) => {
+                this.done = true;
+                Poll::Ready(None)
             }
         }
     }

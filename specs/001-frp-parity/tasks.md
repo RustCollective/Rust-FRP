@@ -319,14 +319,14 @@ US1 完成后即具备 M3（HTTP/3 网关）的起步条件——`vhost::router`
 
 **来源**：2026-10-12 上游真实链路验收。证据见 [research.md](./research.md) D11。
 
-- [ ] T108 修订 `contracts/rfp1-http-vhost.md` §3.3 与 `data-model.md` §4.3：把
+- [x] T108 修订 `contracts/rfp1-http-vhost.md` §3.3 与 `data-model.md` §4.3：把
       "半关闭即体结束"改为显式分帧（`HttpInit 帧 → N 个长度前缀体帧 → 0 长度帧`，
       响应方向同构），并说明为何不再依赖半关闭
-- [ ] T109 按修订后的契约改 `server/src/vhost/proxy.rs`（请求方向分帧 + 不再提前
+- [x] T109 按修订后的契约改 `server/src/vhost/proxy.rs`（请求方向分帧 + 不再提前
       shutdown；响应方向分帧收尾）
-- [ ] T110 按修订后的契约改 `client/src/forward.rs`（两个方向都按帧收发；写完后
+- [x] T110 按修订后的契约改 `client/src/forward.rs`（两个方向都按帧收发；写完后
       等对端关闭连接再释放 socket，关闭时不得有在途数据）
-- [ ] T111 在 `server/tests/e2e.rs` 增加"大响应不截断"回归用例（≥8 MiB，逐字节校验
+- [x] T111 在 `server/tests/e2e.rs` 增加"大响应不截断"回归用例（≥8 MiB，逐字节校验
       长度），并断言客户端关闭前对端已读完
 - [ ] T112 重跑 T053（流式/SC-007）与 T054（延迟/SC-004）的上游真实链路验收
 - [ ] T113 验收通过后清理上游的验收遗留：删除临时 nginx 站点文件并 reload、
