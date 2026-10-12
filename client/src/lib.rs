@@ -23,7 +23,7 @@ use rfp_common::AsyncStream;
 use tokio::net::TcpStream;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_rustls::TlsConnector;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use config::{ClientConfig, ProxyConfig, Transport};
 
@@ -32,6 +32,10 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// QUIC 传输层保活（配合默认 30s 空闲超时，快速感知断线）
 const QUIC_KEEPALIVE: Duration = Duration::from_secs(15);
+/// 单个代理的注册尝试次数：失败不牵连会话，但给「上一会话尚未清理」留出重试窗口
+const REGISTER_ATTEMPTS: usize = 3;
+/// 注册失败后的重试间隔
+const REGISTER_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// run_once 的错误分类：Fatal 放弃重试，Retry 退避后重连
 #[derive(Debug)]
@@ -100,10 +104,45 @@ pub fn quic_endpoint(cfg: &ClientConfig) -> anyhow::Result<quinn::Endpoint> {
     Ok(endpoint)
 }
 
+/// 注册期处理 `NewConnection` 所需的上下文（M1 回连路径）
+struct TunnelDial {
+    server_addr: String,
+    server_port: u16,
+    connector: Option<TlsConnector>,
+    proxies: Arc<HashMap<String, ProxyConfig>>,
+}
+
+impl TunnelDial {
+    /// 收到 `NewConnection`：接管为一次数据连接（注册期与转发期走同一条路径）
+    fn spawn(&self, conn_id: u64, proxy_name: String, http: Option<HttpInit>) {
+        debug!(conn_id, proxy = %proxy_name, http = http.is_some(), "new connection");
+        tokio::spawn(handle_new_conn(
+            self.server_addr.clone(),
+            self.server_port,
+            self.connector.clone(),
+            Arc::clone(&self.proxies),
+            conn_id,
+            proxy_name,
+            http,
+        ));
+    }
+}
+
+/// 代理名 → 配置（数据连接按名字查代理）
+fn proxies_map(cfg: &ClientConfig) -> Arc<HashMap<String, ProxyConfig>> {
+    Arc::new(
+        cfg.proxies
+            .iter()
+            .map(|p| (p.name.clone(), p.clone()))
+            .collect(),
+    )
+}
+
 /// 认证 + 注册代理（TCP/QUIC 共用）
 async fn handshake<S: AsyncStream>(
     framed: &mut Control<S>,
     cfg: &ClientConfig,
+    dial: Option<&TunnelDial>,
 ) -> Result<String, RunError> {
     // 认证
     send_msg(
@@ -140,6 +179,24 @@ async fn handshake<S: AsyncStream>(
 
     // 注册代理
     for p in &cfg.proxies {
+        register_proxy(framed, p, dial).await?;
+    }
+    Ok(session_id)
+}
+
+/// 注册单个代理。
+///
+/// 两条独立于「整条会话重连」的纪律：
+/// - **F5**：单个代理注册失败不得牵连会话——不回 `retry`（那会断开整条控制连接，
+///   让其余代理一起掉线），只在该代理自己身上有限重试。
+/// - **F4**：注册等待期间必须容忍插进来的 `NewConnection`（网关可能先于应答
+///   下发访客连接），按正常数据连接处理而不是当成异常应答断开控制连接。
+async fn register_proxy<S: AsyncStream>(
+    framed: &mut Control<S>,
+    p: &ProxyConfig,
+    dial: Option<&TunnelDial>,
+) -> Result<(), RunError> {
+    for attempt in 1..=REGISTER_ATTEMPTS {
         send_msg(
             framed,
             &Message::RegisterProxy {
@@ -155,25 +212,52 @@ async fn handshake<S: AsyncStream>(
         )
         .await
         .map_err(retry)?;
-        let resp = timeout(HANDSHAKE_TIMEOUT, recv_msg(framed))
-            .await
-            .map_err(|_| retry(anyhow!("register ack timeout")))?
-            .map_err(retry)?;
-        match resp {
-            Some(Message::RegisterProxyAck { name, ok: true, .. }) => {
-                info!(proxy = %name, remote_port = ?p.remote_port, domains = ?p.custom_domains, subdomain = ?p.subdomain, local_addr = p.local_addr, "proxy registered");
+
+        loop {
+            let resp = timeout(HANDSHAKE_TIMEOUT, recv_msg(framed))
+                .await
+                .map_err(|_| retry(anyhow!("register ack timeout")))?
+                .map_err(retry)?;
+            match resp {
+                Some(Message::RegisterProxyAck { name, ok: true, .. }) => {
+                    info!(proxy = %name, remote_port = ?p.remote_port, domains = ?p.custom_domains, subdomain = ?p.subdomain, local_addr = p.local_addr, "proxy registered");
+                    return Ok(());
+                }
+                Some(Message::RegisterProxyAck { name, ok: false, error }) => {
+                    let reason = error.unwrap_or_default();
+                    if attempt >= REGISTER_ATTEMPTS {
+                        // 放弃该代理，但会话与其他代理继续工作
+                        error!(
+                            proxy = %name, error = %reason, attempts = attempt,
+                            "注册被拒且重试耗尽，本代理将不上线（其余代理不受影响）"
+                        );
+                        return Ok(());
+                    }
+                    // 可能是上一会话尚未清理的瞬时冲突：等一会儿重发
+                    warn!(proxy = %name, error = %reason, attempt, "注册被拒，重试");
+                    tokio::time::sleep(REGISTER_RETRY_DELAY).await;
+                    break;
+                }
+                Some(Message::NewConnection { conn_id, proxy_name, http }) => match dial {
+                    Some(d) => d.spawn(conn_id, proxy_name, http),
+                    None => warn!(
+                        conn_id, proxy = %proxy_name,
+                        "new_connection is TCP-only; unexpected over quic"
+                    ),
+                },
+                Some(Message::Ping { ts }) => {
+                    send_msg(framed, &Message::Pong { ts }).await.map_err(retry)?;
+                }
+                Some(Message::Pong { ts }) => debug!(rtt_ms = now_ms() - ts, "pong"),
+                Some(Message::Error { code, message }) => {
+                    return Err(retry(anyhow!("server error during registration: {code}: {message}")));
+                }
+                None => return Err(retry(anyhow!("control connection closed during registration"))),
+                Some(other) => return Err(retry(anyhow!("unexpected register reply: {other:?}"))),
             }
-            Some(Message::RegisterProxyAck { name, ok: false, error }) => {
-                // 按可重试处理：断开重连（可能是上一会话尚未清理的瞬时冲突）
-                return Err(retry(anyhow!(
-                    "proxy `{name}` register failed: {}",
-                    error.unwrap_or_default()
-                )));
-            }
-            other => return Err(retry(anyhow!("unexpected register reply: {other:?}"))),
         }
     }
-    Ok(session_id)
+    Ok(())
 }
 
 /// TLS connector（启用时构建一次）；明文模式返回 None
@@ -222,15 +306,17 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
     let _ = stream.set_nodelay(true);
     let stream = tls_connect(&connector, stream, &cfg).await?;
     let mut framed = control_framed(stream);
-    handshake(&mut framed, &cfg).await?;
+    // 代理表要先于注册构建：注册期也可能插进 NewConnection（F4）
+    let proxies = proxies_map(&cfg);
+    let dial = TunnelDial {
+        server_addr: cfg.server_addr.clone(),
+        server_port: cfg.server_port,
+        connector: connector.clone(),
+        proxies: Arc::clone(&proxies),
+    };
+    handshake(&mut framed, &cfg, Some(&dial)).await?;
 
     // 转发循环
-    let proxies: Arc<HashMap<String, ProxyConfig>> = Arc::new(
-        cfg.proxies
-            .iter()
-            .map(|p| (p.name.clone(), p.clone()))
-            .collect(),
-    );
     let mut ping = interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -244,16 +330,7 @@ pub async fn run_once(cfg: ClientConfig) -> Result<(), RunError> {
                 match msg.map_err(retry)? {
                     None => return Err(retry(anyhow!("control connection closed"))),
                     Some(Message::NewConnection { conn_id, proxy_name, http }) => {
-                        debug!(conn_id, proxy = %proxy_name, http = http.is_some(), "new connection");
-                        tokio::spawn(handle_new_conn(
-                            cfg.server_addr.clone(),
-                            cfg.server_port,
-                            connector.clone(),
-                            Arc::clone(&proxies),
-                            conn_id,
-                            proxy_name,
-                            http,
-                        ));
+                        dial.spawn(conn_id, proxy_name, http);
                     }
                     Some(Message::Ping { ts }) => {
                         send_msg(&mut framed, &Message::Pong { ts })
@@ -308,17 +385,13 @@ pub async fn run_quic_once(
         }
     };
     let mut framed = framed;
-    let session_id = handshake(&mut framed, &cfg).await?;
+    let proxies = proxies_map(&cfg);
+    // QUIC 路径不承载 NewConnection（数据隧道由 server 直接 open_bi 下发）
+    let session_id = handshake(&mut framed, &cfg, None).await?;
     if used_0rtt {
         info!(session = %session_id, "connected (0-RTT)");
     }
 
-    let proxies: Arc<HashMap<String, ProxyConfig>> = Arc::new(
-        cfg.proxies
-            .iter()
-            .map(|p| (p.name.clone(), p.clone()))
-            .collect(),
-    );
     let mut ping = interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {

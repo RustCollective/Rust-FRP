@@ -7,7 +7,8 @@ use rfp_client::config::{
     ClientConfig, LocalTlsConfig, ProxyConfig, TlsConfig as ClientTls, Transport,
 };
 use rfp_client::{quic_endpoint, run_once, run_quic_once, RunError};
-use rfp_common::msg::ProxyType;
+use rfp_common::frame::{control_framed, recv_msg, send_msg};
+use rfp_common::msg::{Message, ProxyType, VERSION};
 
 use rfp_server::config::{
     CertEntry, QuicConfig, ServerConfig, TlsConfig as ServerTls, UdpConfig, UserConfig, VhostListener,
@@ -20,6 +21,75 @@ fn plain_client_tls() -> ClientTls {
     ClientTls {
         enabled: false,
         server_fingerprint: None,
+    }
+}
+
+// ------------------------------------------------ 控制面注册（协议级）
+
+/// 用一条独立控制连接做 Hello + RegisterProxy，返回注册应答。
+///
+/// 拒绝原因（FR-007 / FR-012 / FR-024 要求"必须可区分"）是**服务端**契约，
+/// 客户端的处置策略另由会话级用例覆盖：单个代理注册失败不再断开整条会话
+/// （F5），所以不能再靠 `run_once` 返回错误来断言这些原因。
+async fn control_register(srv_port: u16, token: &str, proxy: ProxyConfig) -> Message {
+    let tcp = TcpStream::connect(("127.0.0.1", srv_port))
+        .await
+        .expect("控制连接失败");
+    let mut framed = control_framed(tcp);
+    send_msg(
+        &mut framed,
+        &Message::Hello {
+            version: VERSION.into(),
+            token: token.into(),
+            hostname: None,
+        },
+    )
+    .await
+    .expect("发送 Hello 失败");
+    match recv_msg(&mut framed).await {
+        Ok(Some(Message::HelloAck { .. })) => {}
+        other => panic!("预期 HelloAck，收到 {other:?}"),
+    }
+    send_msg(
+        &mut framed,
+        &Message::RegisterProxy {
+            name: proxy.name.clone(),
+            proxy_type: proxy.proxy_type,
+            local_addr: proxy.local_addr.clone(),
+            remote_port: proxy.remote_port,
+            vhost: None,
+            vhosts: proxy.custom_domains.clone(),
+            subdomain: proxy.subdomain.clone(),
+        },
+    )
+    .await
+    .expect("发送 RegisterProxy 失败");
+    match recv_msg(&mut framed).await {
+        Ok(Some(msg @ Message::RegisterProxyAck { .. })) => msg,
+        other => panic!("预期 RegisterProxyAck，收到 {other:?}"),
+    }
+}
+
+/// 断言注册被拒并返回原因文本
+async fn expect_register_rejected(srv_port: u16, token: &str, proxy: ProxyConfig) -> String {
+    match control_register(srv_port, token, proxy).await {
+        Message::RegisterProxyAck {
+            ok: false, error, ..
+        } => error.unwrap_or_default(),
+        other => panic!("预期注册被拒，收到 {other:?}"),
+    }
+}
+
+/// tcp 类型代理配置（拒绝原因类断言用；local_addr 不会被服务端校验）
+fn tcp_proxy(name: &str, remote_port: u16, local_addr: &str) -> ProxyConfig {
+    ProxyConfig {
+        name: name.into(),
+        proxy_type: ProxyType::Tcp,
+        local_addr: local_addr.into(),
+        remote_port: Some(remote_port),
+        custom_domains: vec![],
+        subdomain: None,
+        local_tls: LocalTlsConfig::default(),
     }
 }
 
@@ -216,7 +286,18 @@ async fn user_mode_port_authorization() {
     };
 
     // 授权范围内：注册成功 + 转发可用
-    let allowed = client(61005).proxies[0].remote_port.unwrap();
+    // （在授权区间 61000-61010 里挑当前空闲的端口，避免与残留进程打架）
+    let allowed = {
+        let mut found = None;
+        for p in 61000..=61010u16 {
+            if let Ok(l) = TcpListener::bind(("127.0.0.1", p)).await {
+                drop(l);
+                found = Some(p);
+                break;
+            }
+        }
+        found.expect("授权区间 61000-61010 内无空闲端口")
+    };
     {
         tokio::spawn(run_once(client(allowed)));
         let mut user = tokio::time::timeout(Duration::from_secs(10), async {
@@ -235,18 +316,15 @@ async fn user_mode_port_authorization() {
         assert_eq!(&buf, b"hi");
     }
 
-    // 授权范围外：注册被拒
+    // 授权范围外：注册被拒，原因必须点明授权范围
     let outside = safe_port(16200).await;
-    let res = tokio::time::timeout(Duration::from_secs(10), run_once(client(outside)))
-        .await
-        .expect("timeout");
-    match res {
-        Err(RunError::Retry(e)) => assert!(
-            e.to_string().contains("授权范围"),
-            "unexpected error: {e}"
-        ),
-        other => panic!("expect retry error, got: {other:?}"),
-    }
+    let reason = expect_register_rejected(
+        srv_port,
+        "alice-token",
+        tcp_proxy("echo-outside", outside, &format!("127.0.0.1:{echo_port}")),
+    )
+    .await;
+    assert!(reason.contains("授权范围"), "unexpected reason: {reason}");
 
     // 错误 token：认证失败 Fatal
     let res = tokio::time::timeout(
@@ -803,19 +881,23 @@ async fn vhost_domain_conflict_rejected() {
     vhost_get_until_ok(http_port, "app.example.com", "/").await;
 
     // 后注册者：同域名不同代理名，必须被拒且原因里带冲突域名
-    let err = run_once(vhost_client_config(
+    let reason = expect_register_rejected(
         srv_port,
-        ProxyType::Http,
-        "web2",
-        origin_port,
-        vec!["app.example.com".into()],
-    ))
-    .await
-    .expect_err("同域名注册应被拒绝");
-    let msg = format!("{err:?}");
+        "secret",
+        ProxyConfig {
+            name: "web2".into(),
+            proxy_type: ProxyType::Http,
+            local_addr: format!("127.0.0.1:{origin_port}"),
+            remote_port: None,
+            custom_domains: vec!["app.example.com".into()],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        },
+    )
+    .await;
     assert!(
-        msg.contains("app.example.com"),
-        "拒绝原因未指明冲突域名: {msg}"
+        reason.contains("app.example.com"),
+        "拒绝原因未指明冲突域名: {reason}"
     );
 
     // 先注册者仍然可用
@@ -835,19 +917,23 @@ async fn vhost_register_rejected_without_listener() {
         vhost_server_config(srv_port, None, None, vec![]),
     ));
 
-    let err = run_once(vhost_client_config(
+    let reason = expect_register_rejected(
         srv_port,
-        ProxyType::Http,
-        "web",
-        origin_port,
-        vec!["app.example.com".into()],
-    ))
-    .await
-    .expect_err("未配置 [http] 时注册应被拒绝");
-    let msg = format!("{err:?}");
+        "secret",
+        ProxyConfig {
+            name: "web".into(),
+            proxy_type: ProxyType::Http,
+            local_addr: format!("127.0.0.1:{origin_port}"),
+            remote_port: None,
+            custom_domains: vec!["app.example.com".into()],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        },
+    )
+    .await;
     assert!(
-        msg.contains("[http] bind_port"),
-        "拒绝原因未指明缺少的监听段: {msg}"
+        reason.contains("[http] bind_port"),
+        "拒绝原因未指明缺少的监听段: {reason}"
     );
 }
 
@@ -957,11 +1043,24 @@ async fn vhost_domain_authorization() {
     };
 
     // 越权域名：必须被拒，且原因里带域名
-    let err = run_once(client_for("evil.example.com"))
-        .await
-        .expect_err("越权域名应被拒绝");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("evil.example.com"), "拒绝原因未指明域名: {msg}");
+    let reason = expect_register_rejected(
+        srv_port,
+        "alice-token",
+        ProxyConfig {
+            name: "web-evil".into(),
+            proxy_type: ProxyType::Http,
+            local_addr: format!("127.0.0.1:{origin_port}"),
+            remote_port: None,
+            custom_domains: vec!["evil.example.com".into()],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        },
+    )
+    .await;
+    assert!(
+        reason.contains("evil.example.com"),
+        "拒绝原因未指明域名: {reason}"
+    );
 
     // 授权范围内的域名：注册成功且可访问
     tokio::spawn(run_once(client_for("app.alice.dev")));
@@ -1165,11 +1264,21 @@ async fn udp_port_authorization() {
     tokio::spawn(serve(srv_listener, user_server_config(srv_port)));
 
     // alice 的授权区间是 61000-61010
-    let mut cfg = udp_client_config(srv_port, "udp-echo", echo_port, 62000);
-    cfg.token = "alice-token".into();
-    let err = run_once(cfg).await.expect_err("越权 UDP 端口应被拒绝");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("62000"), "拒绝原因未指明端口: {msg}");
+    let reason = expect_register_rejected(
+        srv_port,
+        "alice-token",
+        ProxyConfig {
+            name: "udp-echo-outside".into(),
+            proxy_type: ProxyType::Udp,
+            local_addr: format!("127.0.0.1:{echo_port}"),
+            remote_port: Some(62000),
+            custom_domains: vec![],
+            subdomain: None,
+            local_tls: LocalTlsConfig::default(),
+        },
+    )
+    .await;
+    assert!(reason.contains("62000"), "拒绝原因未指明端口: {reason}");
 
     // 区间内可用
     let mut cfg = udp_client_config(srv_port, "udp-echo", echo_port, 61005);
@@ -1383,4 +1492,376 @@ async fn vhost_http2_authority_becomes_host() {
         head.contains("host: app.example.com"),
         "h2 访客的 Host 没有传到 origin:\n{head}"
     );
+}
+
+// ============================================================ S1 回归：体分帧（T111）
+
+/// 可校验载荷：第 i 字节 = i % 251（逐字节可比）
+fn payload(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+/// 大响应 origin：声明 `Content-Length: n`，分块写出（模拟真实大文件）
+async fn spawn_big_origin(n: usize) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = Arc::new(payload(n));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { break };
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                // 先读完请求头（不关心内容）
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                    body.len()
+                );
+                if s.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                for part in body.chunks(64 * 1024) {
+                    if s.write_all(part).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = s.flush().await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+/// chunked 响应 origin（**不声明 Content-Length**）：响应的结束只能靠分块终止符
+async fn spawn_chunked_origin(chunks: Vec<Vec<u8>>) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let chunks = Arc::new(chunks);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else { break };
+            let chunks = Arc::clone(&chunks);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                if s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                for c in chunks.iter() {
+                    let framed = format!("{:x}\r\n", c.len());
+                    if s.write_all(framed.as_bytes()).await.is_err()
+                        || s.write_all(c).await.is_err()
+                        || s.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = s.write_all(b"0\r\n\r\n").await;
+                let _ = s.flush().await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+/// 走 vhost 明文端口取回完整响应（字节级，不做 UTF-8 假设）
+async fn vhost_request_raw(port: u16, host: &str, path: &str) -> Vec<u8> {
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)).await else {
+        return Vec::new();
+    };
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if s.write_all(req.as_bytes()).await.is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    out
+}
+
+/// 拆出 (响应头原文, 响应体)
+fn split_response(raw: &[u8]) -> (String, Vec<u8>) {
+    let pos = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("响应缺少头体分隔，收到 {} 字节", raw.len()));
+    (
+        String::from_utf8_lossy(&raw[..pos]).to_string(),
+        raw[pos + 4..].to_vec(),
+    )
+}
+
+/// 解 chunked 编码：响应体长度未知时 hyper 会用分块编码发给访客
+fn decode_chunked(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    loop {
+        let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_line = String::from_utf8_lossy(&rest[..pos]).to_string();
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap().trim(), 16)
+            .unwrap_or_else(|e| panic!("分块长度非法 {size_line:?}: {e}"));
+        rest = &rest[pos + 2..];
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
+    out
+}
+
+/// T111：大响应必须逐字节完整送达（8 MiB，体分帧回归）。
+///
+/// 2026-10-12 真实链路验收发现大响应被静默截断（8 MiB 只到 7.8 MiB，64 MiB 只到
+/// 63.5 MiB）：服务端在请求体泵完就半关闭，客户端写完后无法判断对端是否读完，
+/// 一关 socket 内核就以 RST 丢掉在途尾部（research D11 的 F3）。修法是把体改成
+/// 显式分帧 + 关序。回环上跑不出 RST，但这条用例锁定「体不再依赖半关闭 / EOF，
+/// 长度与内容逐字节一致」——这也是 M1/M2 两条承载共用的数据面契约。
+#[tokio::test]
+async fn vhost_large_response_not_truncated() {
+    const N: usize = 8 * 1024 * 1024;
+
+    let origin_port = spawn_big_origin(N).await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(19000).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+
+    let raw = tokio::time::timeout(Duration::from_secs(60), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let raw = vhost_request_raw(http_port, "app.example.com", "/big").await;
+            if raw.starts_with(b"HTTP/1.1 200") {
+                return raw;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "vhost 请求始终未命中，最后一次收到 {} 字节",
+                    raw.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("8 MiB 响应超时");
+
+    let (head, body) = split_response(&raw);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        body.len(),
+        N,
+        "响应体长度不符（截断）：收到 {} / 期望 {N}",
+        body.len()
+    );
+    assert!(body == payload(N), "响应体内容不一致（尾部被截断或错位）");
+}
+
+/// 单次探测：连上代理端口并回读一轮
+async fn echo_once(remote_port: u16, payload: &[u8]) -> bool {
+    let Ok(mut c) = TcpStream::connect(("127.0.0.1", remote_port)).await else {
+        return false;
+    };
+    if c.write_all(payload).await.is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; payload.len()];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), c.read_exact(&mut buf)).await,
+        Ok(Ok(n)) if n == payload.len()
+    ) && buf == payload
+}
+
+/// T116（F5 回归）：单个代理注册失败不得拖垮整个会话。
+///
+/// 一个客户端注册两个 tcp 代理，其中坏的那个用系统临时端口（legacy 模式必然被拒）。
+/// 原实现把该失败当成会话级 Retry：整条控制连接断开重连，好代理每 5 秒陪跑掉线
+/// 一次且永不收敛（2026-10-12 真实链路验收发现）。现在应为：坏代理不上线并在日志
+/// 给出原因，好代理持续可用。
+#[tokio::test]
+async fn one_bad_proxy_does_not_kill_session() {
+    let echo_port = spawn_echo().await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    tokio::spawn(serve(srv_listener, test_server_config(srv_port, "secret")));
+
+    let good_port = safe_port(17200).await;
+    let mk = |name: &str, port: u16| ProxyConfig {
+        name: name.into(),
+        proxy_type: ProxyType::Tcp,
+        local_addr: format!("127.0.0.1:{echo_port}"),
+        remote_port: Some(port),
+        custom_domains: vec![],
+        subdomain: None,
+        local_tls: LocalTlsConfig::default(),
+    };
+    tokio::spawn(run_once(ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Tcp,
+        token: "secret".into(),
+        proxies: vec![
+            mk("good", good_port),
+            // 32768 落在系统临时端口区间：legacy 模式必然拒绝
+            mk("bad", 32768),
+        ],
+        tls: plain_client_tls(),
+    }));
+
+    wait_proxy_and_echo(good_port).await;
+
+    // 跨越一个重连周期（RECONNECT_INTERVAL = 5s）持续探测：好代理不应出现任何失败。
+    // 原实现会在坏代理注册失败后 5s 断开整条会话，这里必然抓到。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        assert!(
+            echo_once(good_port, b"still-up").await,
+            "好代理被坏代理的注册失败拖下线了"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// T115（F4 回归）：注册期插进来的 `NewConnection` 不得被当成异常应答断开会话。
+///
+/// 场景：客户端同时注册一个 vhost 代理与一个「注册必然失败」的 tcp 代理。失败代理
+/// 在客户端侧会占用一段重试窗口，这期间的访客请求命中已注册的 vhost，服务端就会在
+/// 控制通道里插一条 `NewConnection`——原实现把这条消息判成"异常应答"并断开整条控制
+/// 连接，会话反复重启（表现为 vhost 间歇性 404）。现在应按正常数据连接接管，
+/// 探测期间不允许出现任何失败。
+#[tokio::test]
+async fn new_connection_during_registration_is_handled() {
+    let (origin_port, _seen) = spawn_http_origin("reg-race-ok").await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(17300).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+    tokio::spawn(run_once(ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port: srv_port,
+        transport: Transport::Tcp,
+        token: "secret".into(),
+        proxies: vec![
+            ProxyConfig {
+                name: "web".into(),
+                proxy_type: ProxyType::Http,
+                local_addr: format!("127.0.0.1:{origin_port}"),
+                remote_port: None,
+                custom_domains: vec!["app.example.com".into()],
+                subdomain: None,
+                local_tls: LocalTlsConfig::default(),
+            },
+            // 注册必失败（临时端口区间），把客户端卡在注册重试窗口里
+            ProxyConfig {
+                name: "bad".into(),
+                proxy_type: ProxyType::Tcp,
+                local_addr: format!("127.0.0.1:{origin_port}"),
+                remote_port: Some(32768),
+                custom_domains: vec![],
+                subdomain: None,
+                local_tls: LocalTlsConfig::default(),
+            },
+        ],
+        tls: plain_client_tls(),
+    }));
+
+    let ok = vhost_get_until_ok(http_port, "app.example.com", "/").await;
+    assert!(ok.contains("reg-race-ok"), "{ok}");
+
+    // 覆盖失败代理的注册重试窗口（3 次尝试 × 1s 间隔）：会话不得重启
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let resp = vhost_request(http_port, "app.example.com", "/").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "注册期插入的 NewConnection 打断了会话: {resp}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// T111：无 Content-Length 的响应靠 EOB 帧收尾（不再靠隧道 EOF）。
+///
+/// origin 用 chunked 编码应答，hyper 解码后只把裸体交给 vhost 网关——网关这一侧
+/// 已经看不到分块终止符，体结束只能来自显式分帧的 EOB。原实现用「半关闭 = 结束」
+/// 表达这件事，本用例锁住新契约。
+#[tokio::test]
+async fn vhost_chunked_response_completes() {
+    let chunks = vec![
+        payload(1024),
+        payload(3000),
+        payload(7),
+    ];
+    let expect: Vec<u8> = chunks.iter().flatten().copied().collect();
+
+    let origin_port = spawn_chunked_origin(chunks).await;
+    let srv_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let http_port = safe_port(19100).await;
+    tokio::spawn(serve(
+        srv_listener,
+        vhost_server_config(srv_port, Some(http_port), None, vec![]),
+    ));
+    tokio::spawn(run_once(vhost_client_config(
+        srv_port,
+        ProxyType::Http,
+        "web",
+        origin_port,
+        vec!["app.example.com".into()],
+    )));
+
+    let raw = tokio::time::timeout(Duration::from_secs(30), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let raw = vhost_request_raw(http_port, "app.example.com", "/chunked").await;
+            if raw.starts_with(b"HTTP/1.1 200") {
+                return raw;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("chunked vhost 请求始终未命中，最后一次收到 {} 字节", raw.len());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("chunked 响应超时");
+
+    let (head, body) = split_response(&raw);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // 长度未知 → 访客侧响应是分块编码，先解码再比对
+    let body = decode_chunked(&body);
+    assert_eq!(body.len(), expect.len(), "chunked 响应体长度不符: {head}");
+    assert!(body == expect, "chunked 响应体内容不一致: {head}");
 }
