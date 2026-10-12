@@ -83,34 +83,55 @@
   "headers": [["content-type", "text/html"], ["content-length", "1234"]] }
 ```
 
-> ⚠️ **本节的"半关闭表达体结束"约定已被证明有缺陷，待修订。**
-> 2026-10-12 真实链路验收：大响应会被静默截断（8 MiB 只到 7.8 MiB，64 MiB 只到
-> 63.5 MiB），原因是服务端过早半关闭，客户端关闭 socket 时仍有在途数据而被内核
-> RST。完整证据与建议修法（改为显式分帧 + 零长度 EOB 帧）见
-> [research.md D11](./../research.md)。修订前，本节的"半关闭"约定**不要**作为
-> 实现依据。
+### 3.3 数据流时序（显式分帧）
 
-### 3.3 数据流时序
+两个方向的体都是**显式分帧**的，体结束由 **0 长度帧（EOB，end of body）** 表达，
+**不使用半关闭**：
+
+```text
+请求方向（S→C）
+  元数据帧（M1：控制通道 new_connection.http；M2：数据流首帧 conn_init.http）
+  → N 个长度前缀体帧（每帧 ≤ 64 KiB）
+  → 长度前缀 0 的帧（EOB，请求体结束）
+
+响应方向（C→S）
+  http_response_meta 帧
+  → N 个长度前缀体帧（每帧 ≤ 64 KiB）
+  → 长度前缀 0 的帧（EOB，响应体结束）
+```
 
 ```text
 M2（QUIC，server 开 bi-stream）        M1（TCP，client 回连后）
 
   server ──conn_init{http}──► client   server ──new_connection{http}──► client  （控制通道）
-  server ──request body ────► client   client ──conn_init{conn_id}────► server  （新数据连接）
-                                        server ──request body ───────► client
-  ── 半关闭（request body EOF）──
-
+  server ──体帧* ──EOB─────► client    client ──conn_init{conn_id}────► server  （新数据连接）
+                                       server ──体帧* ──EOB──────────► client
   client ──http_response_meta─► server
-  client ──response body ────► server
-  ── 半关闭（response body EOF）──
+  client ──体帧* ──EOB──────► server
+  server ── 读完 EOB 后排空并关闭隧道 ──► client
 ```
+
+**为什么不再用半关闭**（2026-10-12 真实链路验收，[research.md D11](../research.md)）：
+服务端在请求体泵完就半关闭，客户端因此在响应体写完后**无法判断服务端是否已读完**——
+读方向早已 EOF。客户端一关 socket，内核就以 RST 丢弃发送队列里尚未送达的尾部
+（8 MiB 实测丢 2.7 MiB）。显式分帧把「体结束」变成一个可观察的协议事件，两侧都不再
+需要靠 EOF 或半关闭表达语义。
 
 **硬性约束**
 
-- 元数据帧 MUST 是该方向在数据流上的**第一条消息**；其后全部是裸字节，直到该方向半关闭。
-- 请求体 / 响应体的流式转发 MUST NOT 整体缓冲（FR-011）。
+- 元数据帧 MUST 是该方向在数据流上的**第一条消息**；其后是体帧，直到 EOB 帧。
+- 读方向 MUST 读到 EOB 才算体结束；**在 EOB 之前读到 EOF MUST 视为截断错误**，
+  MUST NOT 静默当作体结束（否则中间设备提前 FIN 会变成静默丢数据）。
+- 写方向 MUST 以 EOB 帧结束体传输，MUST NOT 依赖半关闭 / EOF 表达体结束。
+- **关序**：写方写完 EOB 后 MUST 等到读方向结束（对端读完并关闭隧道）再释放
+  socket；读方结束转发前 MUST 把本方向读到 EOB（或排空到 EOF）再关闭——
+  带着未读数据关闭会让内核发 RST，丢掉对端在途数据。
+- 请求体 / 响应体的流式转发 MUST NOT 整体缓冲（FR-011）；体帧逐帧透传，不做攒批。
 - 元数据帧超过 64 KiB 上限时：服务端回 `4xx` 响应并**正常结束本次转发**，
   MUST NOT 断开控制通道、MUST NOT 影响同一会话的其他代理。
+
+**实现上限**：单帧上限沿用 RFP/1 的 64 KiB（`MAX_FRAME`）；两侧实现按 16 KiB 切片
+写帧（更细的背压粒度），读侧 MUST 接受任意 ≤ 64 KiB 的帧长。
 
 ## 4. 头字段处置（FR-004、FR-005）
 
