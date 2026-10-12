@@ -333,9 +333,13 @@ US1 完成后即具备 M3（HTTP/3 网关）的起步条件——`vhost::router`
       acceptance/2026-10-12-real-link.md §7.2（含 F3 大响应复验与回滚步骤）
 - [ ] T113 验收通过后清理上游的验收遗留：删除临时 nginx 站点文件并 reload、
       按需移除 `rfps.toml` 中的 `[http]`/`[https]`/`[[certs]]` 与 65532 端口授权
-- [ ] T114 查 SpecKit 是否有"验收记录"类的标准产物位置与流程（当前落在
+- [x] T114 查 SpecKit 是否有"验收记录"类的标准产物位置与流程（当前落在
       `specs/001-frp-parity/acceptance/` 属自定约定）；确认后决定是否迁移，
       并同步修正 quickstart.md 第 0 节的路径说明
+      → 已核对 `.specify/templates/`：只有 spec/plan/tasks/checklist/constitution
+      五类模板，无验收结果类产物（spec 里的 "Acceptance Scenarios" 是场景定义）。
+      结论：不迁移，把 `specs/<feature>/acceptance/<日期>-<主题>.md` 固化为项目约定，
+      写入 `docs/CONVENTIONS.md`「测试要求」
 - [x] T115 修 F4 注册期竞态：客户端注册循环必须能容忍并排队处理插进来的
       `NewConnection`（当前会把非 `RegisterProxyAck` 的应答当成异常并断开整条
       控制连接）。证据见 acceptance/2026-10-12-real-link.md F4

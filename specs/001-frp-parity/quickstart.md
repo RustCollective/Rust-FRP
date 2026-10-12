@@ -18,10 +18,11 @@
 
 | 日期 | 记录 | 结论 |
 |---|---|---|
-| 2026-10-12 | [S1 真实链路](./acceptance/2026-10-12-real-link.md) | 核心场景通过；大响应截断（未修，见 research.md D11）；2 处缺陷当场修复 |
+| 2026-10-12 | [S1 真实链路](./acceptance/2026-10-12-real-link.md) | 第一轮：核心场景通过；大响应截断（F3）；2 处缺陷当场修复。第二轮（§7）：本机门禁通过，真实链路复验待执行 |
 
-> 目录位置是暂定的——SpecKit 产物清单里没有"验收记录"这一类，待确认是否有标准流程
-> （见 [tasks.md](./tasks.md) T114）。
+> 位置是**项目约定**（非 SpecKit 产物）：`.specify/templates/` 只有 spec/plan/tasks/
+> checklist/constitution 五类，验收结果无官方位置。约定见 `docs/CONVENTIONS.md`
+> 「测试要求」（T114 已结案）。
 
 ## 1. 环境前置
 

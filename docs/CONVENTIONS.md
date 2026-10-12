@@ -33,6 +33,9 @@
   /opt/rust-frp，systemd 托管 `rfps.service`，控制端口 10085、测试代理端口 65533
 - **本机 = 客户端侧**：systemd 托管 `rfpc.service`（/usr/local/bin/rfpc +
   /etc/rust-frp/rfpc.toml），承载 jyutyu.cn 生产隧道
+- **验收记录位置**（项目约定，SpecKit 无此类标准产物）：真实链路与人工验收的结果
+  落在 `specs/<feature>/acceptance/<YYYY-MM-DD>-<主题>.md`，内容包含环境事实、
+  逐场景结果、发现、未验证项与复现命令；未执行的场景要写明原因与下一轮可执行清单
 
 ## 设计决策记录（勿回退）
 
